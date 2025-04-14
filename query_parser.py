@@ -67,8 +67,12 @@ class SQLMetadataExtractor:
             for table, codes in table_source_codes.items():
                 clean_table = table.split('.')[-1].strip('`"[] ').lower()
                 if clean_table in result:
+                    # Ensure we're not losing any values during the update
+                    print(f"\nUpdating source codes for table {clean_table}")
+                    print(f"Current codes in result: {sorted(list(result[clean_table][1]))}")
+                    print(f"New codes to add: {sorted(list(codes))}")
                     result[clean_table][1].update(codes)
-                    print(f"Updated result for table {clean_table} with source codes: {sorted(list(codes))}")
+                    print(f"Updated codes in result: {sorted(list(result[clean_table][1]))}")
             
             print("\nFinal result dictionary:")
             for table, (cols, codes) in result.items():
@@ -187,7 +191,7 @@ class SQLMetadataExtractor:
                 (\w+)                             # Table name or alias
                 \.{col}\s*                        # Column name
                 =\s*                              # Equals operator
-                ([^,;\s)]+)                       # Value after equals (until comma, semicolin, space, or closing parenthesis)
+                ([^,;\s)]+)                       # Value after equals (until comma, semicolon, space, or closing parenthesis)
             '''
             
             # Process IN clause matches
@@ -224,8 +228,9 @@ class SQLMetadataExtractor:
                             print(f"Adding cleaned value: {value}")
                     
                     # Update source codes for the table
+                    print(f"Current source codes for {actual_table}: {sorted(list(table_source_codes[actual_table]))}")
                     table_source_codes[actual_table].update(cleaned_values)
-                    print(f"Updated source codes for {actual_table}: {table_source_codes[actual_table]}")
+                    print(f"Updated source codes for {actual_table}: {sorted(list(table_source_codes[actual_table]))}")
             
             # Process equals operator matches
             equals_matches = re.finditer(equals_pattern, sql)
@@ -246,8 +251,9 @@ class SQLMetadataExtractor:
                     value = value.strip().strip("'\"")
                     if value and value.upper() not in {'AND', 'OR', 'IN', 'NOT', 'NULL', 'TRUE', 'FALSE'}:
                         print(f"Adding cleaned value: {value}")
+                        print(f"Current source codes for {actual_table}: {sorted(list(table_source_codes[actual_table]))}")
                         table_source_codes[actual_table].add(value)
-                        print(f"Updated source codes for {actual_table}: {table_source_codes[actual_table]}")
+                        print(f"Updated source codes for {actual_table}: {sorted(list(table_source_codes[actual_table]))}")
             
             # CTE pattern for IN clause
             cte_in_pattern = fr'''(?ix)            # Case insensitive and verbose mode
@@ -301,8 +307,9 @@ class SQLMetadataExtractor:
                             print(f"Adding cleaned value: {value}")
                     
                     # Update source codes for the table
+                    print(f"Current source codes for {cte_name}: {sorted(list(table_source_codes[cte_name]))}")
                     table_source_codes[cte_name].update(cleaned_values)
-                    print(f"Updated source codes for {cte_name}: {table_source_codes[cte_name]}")
+                    print(f"Updated source codes for {cte_name}: {sorted(list(table_source_codes[cte_name]))}")
             
             # Process CTE equals operator matches
             cte_equals_matches = re.finditer(cte_equals_pattern, sql)
@@ -319,8 +326,9 @@ class SQLMetadataExtractor:
                     value = value.strip().strip("'\"")
                     if value and value.upper() not in {'AND', 'OR', 'IN', 'NOT', 'NULL', 'TRUE', 'FALSE'}:
                         print(f"Adding cleaned value: {value}")
+                        print(f"Current source codes for {cte_name}: {sorted(list(table_source_codes[cte_name]))}")
                         table_source_codes[cte_name].add(value)
-                        print(f"Updated source codes for {cte_name}: {table_source_codes[cte_name]}")
+                        print(f"Updated source codes for {cte_name}: {sorted(list(table_source_codes[cte_name]))}")
         
         print("\n=== Final source codes dictionary ===")
         for table, codes in table_source_codes.items():
