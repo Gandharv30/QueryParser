@@ -260,7 +260,7 @@ class SQLMetadataExtractor:
             print(f"Resolved table reference: {table_ref} -> {actual_table}")
 
             # Only process if it's an actual table and exists in our result
-            if actual_table in alias_list:
+            if table_ref in alias_list:
                 columns.add(column)
                 print(f"Added column {column} for table {actual_table}")
 
@@ -549,22 +549,139 @@ JOIN cte6 c6 ON c5.col1 = c6.col1
 JOIN cte7 c7 ON c6.col1 = c7.col1
 JOIN cte8 c8 ON c7.col1 = c8.col1
             """
+        },
+        {
+            "name": "CTE with Column Aliases Test",
+            "sql": """
+                WITH cte1 AS (
+                    SELECT t1.col1 as column1, t1.data_srce_cde as source_code
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde = 'A1'
+                )
+                SELECT c1.column1, c1.source_code
+                FROM cte1 c1
+            """
+        },
+        {
+            "name": "CTE with Multiple Source Codes Test",
+            "sql": """
+                WITH cte1 AS (
+                    SELECT t1.col1, t1.data_srce_cde, t1.ar_srce_cde
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde = 'A1'
+                    AND t1.ar_srce_cde IN ('X1', 'X2', 'X3')
+                )
+                SELECT c1.*
+                FROM cte1 c1
+            """
+        },
+        {
+            "name": "CTE with Complex WHERE Conditions",
+            "sql": """
+                WITH cte1 AS (
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde = 'A1'
+                    AND (t1.col1 > 100 OR t1.col1 < 50)
+                    AND t1.col2 IS NOT NULL
+                )
+                SELECT c1.*
+                FROM cte1 c1
+            """
+        },
+        {
+            "name": "CTE with UNION and Multiple Tables",
+            "sql": """
+                WITH cte1 AS (
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde = 'A1'
+                    UNION ALL
+                    SELECT t2.col1, t2.ar_srce_cde
+                    FROM table2 t2
+                    WHERE t2.ar_srce_cde = 'X1'
+                )
+                SELECT c1.*
+                FROM cte1 c1
+            """
+        },
+        {
+            "name": "CTE with Self-Join and Window Functions",
+            "sql": """
+                WITH cte1 AS (
+                    SELECT 
+                        t1.col1,
+                        t1.data_srce_cde,
+                        ROW_NUMBER() OVER (PARTITION BY t1.data_srce_cde ORDER BY t1.col1) as rn
+                    FROM table1 t1
+                ),
+                cte2 AS (
+                    SELECT 
+                        c1.col1,
+                        c1.data_srce_cde,
+                        c2.col1 as prev_col1
+                    FROM cte1 c1
+                    LEFT JOIN cte1 c2 ON c1.rn = c2.rn + 1
+                        AND c1.data_srce_cde = c2.data_srce_cde
+                )
+                SELECT c2.*
+                FROM cte2 c2
+            """
+        },
+        {
+            "name": "CTE with Nested Subqueries in JOIN",
+            "sql": """
+                WITH cte1 AS (
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde = 'A1'
+                )
+                SELECT c1.*, t2.*
+                FROM cte1 c1
+                JOIN table2 t2 ON t2.col1 = c1.col1
+                    AND t2.ar_srce_cde IN (
+                        SELECT t3.ar_srce_cde
+                        FROM table3 t3
+                        WHERE t3.data_srce_cde = 'B1'
+                    )
+            """
+        },
+        {
+            "name": "CTE with Complex Column References",
+            "sql": """
+                WITH cte1 AS (
+                    SELECT 
+                        CASE 
+                            WHEN t1.data_srce_cde = 'A1' THEN t1.col1
+                            WHEN t1.data_srce_cde = 'B1' THEN t2.col1
+                            ELSE t3.col1
+                        END as derived_col,
+                        t1.data_srce_cde,
+                        t2.ar_srce_cde,
+                        t3.data_srce_cde as alt_source
+                    FROM table1 t1
+                    LEFT JOIN table2 t2 ON t1.col1 = t2.col1
+                    LEFT JOIN table3 t3 ON t2.col1 = t3.col1
+                )
+                SELECT c1.*
+                FROM cte1 c1
+            """
         }
     ]
     
     for test in test_cases:
         try:
-            result = extractor._extract_sql_metadata(test['sql'])
             print(f"\n=== Running Test: {test['name']} ===")
             print("\nSQL Query:")
             print(test['sql'])
+            result = extractor._extract_sql_metadata(test['sql'])
             print("\nExtracted Metadata:")
             for table, metadata in result.items():
                 print(f"\nTable: {table}")
                 print(f"Columns: {sorted(list(metadata['columns']))}")
                 print(f"Source Codes: {sorted(list(metadata['source_codes']))}")
         except Exception as e:
-            print(f"Error processing test case: {str(e)}")
+            print(f"Error processing test case {test['name']}: {str(e)}")
             continue
 
 if __name__ == "__main__":
