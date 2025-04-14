@@ -146,16 +146,20 @@ class SQLMetadataExtractor:
         
         # Extract source codes using comprehensive patterns
         for col in self.source_code_columns:
-            # Main pattern for IN clause - case insensitive
+            # Main pattern for IN clause - case insensitive, handles newlines
             in_pattern = fr'''(?ix)                 # Case insensitive and verbose mode
                 (?:FROM|JOIN|WHERE|AND|OR|\()\s*   # SQL keywords or opening parenthesis
                 (?:(\w+)\.)?                       # Optional schema
                 (\w+)                              # Table name or alias
-                \.{col}\s+                         # Column name
-                IN\s*\(\s*                         # IN clause start with optional whitespace
-                (?:'[^']*'(?:\s*,\s*'[^']*')*     # One or more quoted values
-                |\w+(?:\s*,\s*\w+)*)              # Or one or more unquoted values
-                \s*\)                              # Closing parenthesis with optional whitespace
+                \.{col}                            # Column name
+                \s*IN\s*\(\s*                      # IN clause start with optional whitespace
+                (                                  # Start capturing values
+                    (?:                           # Start non-capturing group
+                        '[^']*'                   # A quoted value
+                        (?:\s*,\s*'[^']*')*      # More quoted values after commas
+                    )                             # End non-capturing group
+                )                                 # End capturing values
+                \s*\)                             # Closing parenthesis with optional whitespace
             '''
             
             # Pattern for single value with = operator - case insensitive
@@ -163,15 +167,15 @@ class SQLMetadataExtractor:
                 (?:FROM|JOIN|WHERE|AND|OR|\()\s*  # SQL keywords or opening parenthesis
                 (?:(\w+)\.)?                      # Optional schema
                 (\w+)                             # Table name or alias
-                \.{col}\s*                        # Column name
-                =\s*                              # Equals operator
+                \.{col}                           # Column name
+                \s*=\s*                           # Equals operator with optional whitespace
                 '([^']*)'                         # Single quoted value
             '''
             
             # Process IN clause matches
             in_matches = re.finditer(in_pattern, sql)
             for match in in_matches:
-                schema, table_ref = match.groups()[:2]  # Get schema and table reference
+                schema, table_ref, values_str = match.groups()
                 table_ref = table_ref.lower() if table_ref else ''
                 
                 # Get actual table name from alias if exists
@@ -180,17 +184,10 @@ class SQLMetadataExtractor:
                 if actual_table in table_source_codes:
                     # Extract all quoted values
                     values = []
-                    # Match all quoted values with proper handling of commas and whitespace
+                    # Match all quoted values, handling newlines and whitespace
                     quoted_pattern = r"'([^']+)'"
-                    quoted_values = re.findall(quoted_pattern, match.group(0))
-                    values.extend(quoted_values)
-                    
-                    # Match unquoted values (case insensitive)
-                    unquoted_str = re.sub(r"'[^']*'", "", match.group(0))  # Remove quoted values
-                    unquoted_pattern = r'(?i)(?:^|,\s*)([a-zA-Z0-9_]+)(?:\s*(?:,|$))'
-                    unquoted_values = re.findall(unquoted_pattern, unquoted_str)
-                    sql_keywords = {'AND', 'OR', 'IN', 'NOT', 'NULL', 'TRUE', 'FALSE'}
-                    values.extend([v.strip() for v in unquoted_values if v.strip().upper() not in sql_keywords])
+                    quoted_values = re.findall(quoted_pattern, values_str)
+                    values.extend([v.strip() for v in quoted_values])
                     
                     # Update source codes for the table
                     table_source_codes[actual_table].update(values)
@@ -206,7 +203,7 @@ class SQLMetadataExtractor:
                 
                 if actual_table in table_source_codes:
                     # Add the single value
-                    table_source_codes[actual_table].add(value)
+                    table_source_codes[actual_table].add(value.strip())
             
             # CTE pattern for IN clause - case insensitive
             cte_in_pattern = fr'''(?ix)            # Case insensitive and verbose mode
@@ -214,30 +211,29 @@ class SQLMetadataExtractor:
                 (?:.*?,\s*)*                       # Any preceding CTEs
                 (\w+)                              # CTE name
                 (?:\s+AS\s+)?\s*\(                # Optional AS and opening parenthesis
-                [^()]*                            # Non-parentheses content
+                (?:[^()]|\([^()]*\))*?            # Non-greedy match of content
                 {col}\s+IN\s*\(\s*                # Column and IN clause
-                (?:'[^']*'(?:\s*,\s*'[^']*')*    # One or more quoted values
-                |\w+(?:\s*,\s*\w+)*)             # Or one or more unquoted values
-                \s*\)                             # Closing parenthesis
+                (                                 # Start capturing values
+                    (?:                          # Start non-capturing group
+                        '[^']*'                  # A quoted value
+                        (?:\s*,\s*'[^']*')*     # More quoted values after commas
+                    )                            # End non-capturing group
+                )                                # End capturing values
+                \s*\)                            # Closing parenthesis
             '''
             
             # Process CTE IN clause matches
             cte_in_matches = re.finditer(cte_in_pattern, sql)
             for match in cte_in_matches:
                 cte_name = match.group(1).lower()
+                values_str = match.group(2) if len(match.groups()) > 1 else ''
                 
                 if cte_name in table_source_codes:
                     # Extract values using the same patterns
                     values = []
                     quoted_pattern = r"'([^']+)'"
-                    quoted_values = re.findall(quoted_pattern, match.group(0))
-                    values.extend(quoted_values)
-                    
-                    unquoted_str = re.sub(r"'[^']*'", "", match.group(0))
-                    unquoted_pattern = r'(?i)(?:^|,\s*)([a-zA-Z0-9_]+)(?:\s*(?:,|$))'
-                    unquoted_values = re.findall(unquoted_pattern, unquoted_str)
-                    sql_keywords = {'AND', 'OR', 'IN', 'NOT', 'NULL', 'TRUE', 'FALSE'}
-                    values.extend([v.strip() for v in unquoted_values if v.strip().upper() not in sql_keywords])
+                    quoted_values = re.findall(quoted_pattern, values_str)
+                    values.extend([v.strip() for v in quoted_values])
                     
                     table_source_codes[cte_name].update(values)
         
@@ -444,6 +440,18 @@ def test_queries():
             FROM table1 t1
             JOIN table2 t2 ON t1.id = t2.id
             WHERE t1.data_srce_cde IN ('AF', 'BC', 'CA')
+            AND t2.ar_srce_cde IN ('X1','Y2', 'Z3')
+            AND t2.data_srce_cde = 'D1';
+            """
+        },
+        {
+            "name": "Newline IN Clause Test",
+            "query": """
+            SELECT t1.*, t2.column1
+            FROM table1 t1
+            JOIN table2 t2 ON t1.id = t2.id
+            WHERE 
+                t1.data_srce_cde IN ('AF','BC','CA')
             AND t2.ar_srce_cde IN ('X1','Y2', 'Z3')
             AND t2.data_srce_cde = 'D1';
             """
