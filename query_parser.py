@@ -152,14 +152,20 @@ class SQLMetadataExtractor:
                 (?:(\w+)\.)?                       # Optional schema
                 (\w+)                              # Table name or alias
                 \.{col}                            # Column name
-                \s*IN\s*\(\s*                      # IN clause start with optional whitespace
+                (?:\s|\n)*IN(?:\s|\n)*            # IN keyword with optional whitespace/newlines
+                \(                                 # Opening parenthesis
+                (?:\s|\n)*                         # Optional whitespace/newlines
                 (                                  # Start capturing values
-                    (?:                           # Start non-capturing group
-                        '[^']*'                   # A quoted value
-                        (?:\s*,\s*'[^']*')*      # More quoted values after commas
-                    )                             # End non-capturing group
+                    (?:                           # Start group for first value
+                        '(?:[^']|'')*'            # Quoted value (handles escaped quotes)
+                        (?:                       # Start group for additional values
+                            (?:\s|\n)*,(?:\s|\n)* # Comma with optional whitespace/newlines
+                            '(?:[^']|'')*'        # Additional quoted value
+                        )*                        # Zero or more additional values
+                    )                             # End value group
                 )                                 # End capturing values
-                \s*\)                             # Closing parenthesis with optional whitespace
+                (?:\s|\n)*                        # Optional whitespace/newlines
+                \)                                # Closing parenthesis
             '''
             
             # Pattern for single value with = operator - case insensitive
@@ -168,7 +174,7 @@ class SQLMetadataExtractor:
                 (?:(\w+)\.)?                      # Optional schema
                 (\w+)                             # Table name or alias
                 \.{col}                           # Column name
-                \s*=\s*                           # Equals operator with optional whitespace
+                (?:\s|\n)*=(?:\s|\n)*            # Equals operator with optional whitespace/newlines
                 '([^']*)'                         # Single quoted value
             '''
             
@@ -185,7 +191,7 @@ class SQLMetadataExtractor:
                     # Extract all quoted values
                     values = []
                     # Match all quoted values, handling newlines and whitespace
-                    quoted_pattern = r"'([^']+)'"
+                    quoted_pattern = r"'((?:[^']|'')+)'"  # Handle escaped quotes
                     quoted_values = re.findall(quoted_pattern, values_str)
                     values.extend([v.strip() for v in quoted_values])
                     
@@ -212,14 +218,21 @@ class SQLMetadataExtractor:
                 (\w+)                              # CTE name
                 (?:\s+AS\s+)?\s*\(                # Optional AS and opening parenthesis
                 (?:[^()]|\([^()]*\))*?            # Non-greedy match of content
-                {col}\s+IN\s*\(\s*                # Column and IN clause
-                (                                 # Start capturing values
-                    (?:                          # Start non-capturing group
-                        '[^']*'                  # A quoted value
-                        (?:\s*,\s*'[^']*')*     # More quoted values after commas
-                    )                            # End non-capturing group
-                )                                # End capturing values
-                \s*\)                            # Closing parenthesis
+                {col}                              # Column name
+                (?:\s|\n)*IN(?:\s|\n)*            # IN keyword with optional whitespace/newlines
+                \(                                 # Opening parenthesis
+                (?:\s|\n)*                         # Optional whitespace/newlines
+                (                                  # Start capturing values
+                    (?:                           # Start group for first value
+                        '(?:[^']|'')*'            # Quoted value (handles escaped quotes)
+                        (?:                       # Start group for additional values
+                            (?:\s|\n)*,(?:\s|\n)* # Comma with optional whitespace/newlines
+                            '(?:[^']|'')*'        # Additional quoted value
+                        )*                        # Zero or more additional values
+                    )                             # End value group
+                )                                 # End capturing values
+                (?:\s|\n)*                        # Optional whitespace/newlines
+                \)                                # Closing parenthesis
             '''
             
             # Process CTE IN clause matches
@@ -231,7 +244,7 @@ class SQLMetadataExtractor:
                 if cte_name in table_source_codes:
                     # Extract values using the same patterns
                     values = []
-                    quoted_pattern = r"'([^']+)'"
+                    quoted_pattern = r"'((?:[^']|'')+)'"  # Handle escaped quotes
                     quoted_values = re.findall(quoted_pattern, values_str)
                     values.extend([v.strip() for v in quoted_values])
                     
@@ -452,6 +465,19 @@ def test_queries():
             JOIN table2 t2 ON t1.id = t2.id
             WHERE 
                 t1.data_srce_cde IN ('AF','BC','CA')
+            AND t2.ar_srce_cde IN ('X1','Y2', 'Z3')
+            AND t2.data_srce_cde = 'D1';
+            """
+        },
+        {
+            "name": "Newline Before IN Test",
+            "query": """
+            SELECT t1.*, t2.column1
+            FROM table1 t1
+            JOIN table2 t2 ON t1.id = t2.id
+            WHERE 
+                t1.data_srce_cde 
+                IN ('AF','BC','CA')
             AND t2.ar_srce_cde IN ('X1','Y2', 'Z3')
             AND t2.data_srce_cde = 'D1';
             """
