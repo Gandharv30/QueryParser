@@ -24,23 +24,22 @@ class SQLMetadataExtractor:
         self.dialect = dialect
         # No class-level state needed for results; process each query independently.
 
+        # Updated _extract_sql_metadata method
     def _extract_sql_metadata(self, sql_str: str) -> Dict[str, Dict[str, Set[str]]]:
         """
         Extract metadata from SQL query using sqlglot AST traversal.
-
+    
         Returns a dictionary mapping actual table names (lowercase, potentially schema-qualified
         if schema is used consistently) to their extracted columns and source codes.
         """
         if not sql_str or not isinstance(sql_str, str):
             logger.warning("Received empty or non-string SQL input.")
             return {}
-
+    
         try:
             # Parse the SQL into an AST
-            # Use try-except for parsing errors specifically
             try:
                 parsed_expressions = sqlglot.parse(sql_str, read=self.dialect)
-                # Assuming a single statement for now; handle multiple if needed
                 if not parsed_expressions:
                     logger.warning("SQL string parsed into an empty expression list.")
                     return {}
@@ -48,143 +47,121 @@ class SQLMetadataExtractor:
             except Exception as parse_error:
                 logger.error(f"sqlglot failed to parse SQL: {parse_error}\nQuery snippet: {sql_str[:500]}...")
                 return {}
-
-            # --- Data Structures ---
-            # Maps alias -> actual table name (lowercase, potentially schema.table)
+    
+            # Data Structures
             alias_to_table_map: Dict[str, str] = {}
-            # Stores details: actual_table_name -> {columns, source_codes}
             table_details: Dict[str, Dict[str, Set[str]]] = {}
-            # Keep track of CTE names (lowercase)
             cte_names: Set[str] = set()
-
+    
             # --- 1. Find CTEs ---
-            # sqlglot represents CTEs within the main query expression
             if isinstance(parsed, exp.Query) and parsed.ctes:
                 for cte in parsed.ctes:
                     if isinstance(cte, exp.CTE) and cte.alias:
-                         cte_names.add(cte.alias.lower())
+                        cte_names.add(cte.alias.lower())
+                        # Process CTE recursively
+                        cte_metadata = self._extract_sql_metadata(cte.this.sql())
+                        table_details[cte.alias.lower()] = cte_metadata.get(cte.alias.lower(), {"columns": set(), "source_codes": set()})
+    
             logging.debug(f"Found CTE names: {cte_names}")
-
+    
             # --- 2. Find Tables and Aliases (excluding CTEs) ---
-            # Iterate through all table expressions in the AST
             for table_expr in parsed.find_all(exp.Table):
                 table_name_parts = []
-                # Handle schema.table format
-                if table_expr.db: # Schema/Database
+                if table_expr.db:
                     table_name_parts.append(table_expr.db.lower())
                 table_name_parts.append(table_expr.name.lower())
                 full_table_name = ".".join(table_name_parts)
-
-                # Skip if this table name is actually a CTE
+    
                 if full_table_name in cte_names:
-                    # Still record the alias if present, mapping it to the CTE name
                     if table_expr.alias:
                         alias_to_table_map[table_expr.alias.lower()] = full_table_name
                     continue
-
-                # Determine the alias (use table name if no explicit alias)
+    
                 alias = table_expr.alias.lower() if table_expr.alias else full_table_name
-
-                # Initialize details if this is the first time seeing this table
                 if full_table_name not in table_details:
                     table_details[full_table_name] = {'columns': set(), 'source_codes': set()}
-
-                # Map the alias to the actual table name
                 alias_to_table_map[alias] = full_table_name
-                # Also map the table name itself to itself for direct references
                 if alias != full_table_name:
-                     alias_to_table_map[full_table_name] = full_table_name
-
-
+                    alias_to_table_map[full_table_name] = full_table_name
+    
             logging.debug(f"Found non-CTE tables: {list(table_details.keys())}")
             logging.debug(f"Alias map: {alias_to_table_map}")
-
-            # --- 3. Find Columns associated with non-CTE tables ---
-            # Iterate through all column expressions in the AST
-            processed_col_keys: Set[Tuple[str, str]] = set() # (actual_table, column_upper)
+    
+            # --- 3. Find Columns ---
+            processed_col_keys: Set[Tuple[str, str]] = set()
             for col_expr in parsed.find_all(exp.Column):
-                if not col_expr.table: # Column without explicit alias/table qualifier (e.g., SELECT col1)
-                    # Difficult to reliably map without context; skip for now or add complex resolution logic
-                    continue
-
-                table_ref = col_expr.table.lower() # Alias or table name used in the query
-                column_name = col_expr.name # Keep original case? Or standardize? Let's standardize.
+                table_ref = col_expr.table.lower() if col_expr.table else None
                 column_name_upper = col_expr.name.upper()
-
-                # Resolve the alias/reference to the actual table name
+    
+                if not table_ref:
+                    if len(alias_to_table_map) == 1:
+                        table_ref = list(alias_to_table_map.keys())[0]
+                    else:
+                        continue
+    
                 actual_table = alias_to_table_map.get(table_ref)
-
-                # Only add if it maps to a known, non-CTE table
                 if actual_table and actual_table in table_details:
                     col_key = (actual_table, column_name_upper)
                     if col_key not in processed_col_keys:
                         table_details[actual_table]['columns'].add(column_name_upper)
                         processed_col_keys.add(col_key)
                         logging.debug(f"Found column: {actual_table}.{column_name_upper}")
-
-            # --- 4. Find Source Codes in WHERE clauses ---
-            # Iterate through WHERE clauses and check conditions
+    
+            # --- 4. Find Source Codes in WHERE Clauses ---
             for where_clause in parsed.find_all(exp.Where):
-                # Look for EQ (=) and IN expressions within the WHERE clause
                 for condition in where_clause.find_all((exp.EQ, exp.In)):
                     column_ref_node = None
                     value_nodes = []
-
-                    # Check if the left side is a column reference
+    
                     if isinstance(condition.left, exp.Column) and condition.left.table:
                         column_ref_node = condition.left
-                        # For EQ, right side is the value
                         if isinstance(condition, exp.EQ):
-                             if isinstance(condition.right, (exp.Literal, exp.String)):
+                            if isinstance(condition.right, (exp.Literal, exp.String)):
                                 value_nodes.append(condition.right)
-                        # For IN, right side is a list/tuple of values
                         elif isinstance(condition, exp.In) and isinstance(condition.right, (exp.Tuple, exp.List)):
-                             value_nodes.extend(condition.right.expressions)
-
-                    # Check if the right side is a column reference (e.g., 'val' = t1.col) - less common
+                            value_nodes.extend(condition.right.expressions)
+    
                     elif isinstance(condition.right, exp.Column) and condition.right.table:
-                         if isinstance(condition, exp.EQ) and isinstance(condition.left, (exp.Literal, exp.String)):
+                        if isinstance(condition, exp.EQ) and isinstance(condition.left, (exp.Literal, exp.String)):
                             column_ref_node = condition.right
                             value_nodes.append(condition.left)
-                         # IN operator usually has column on the left
-
+    
                     if not column_ref_node:
-                        continue # Condition doesn't match alias.col = 'val' or alias.col IN (...)
-
-                    # Check if the column is one of our target source code columns
+                        continue
+    
                     col_name_upper = column_ref_node.name.upper()
                     if col_name_upper in self.source_code_columns:
                         table_ref = column_ref_node.table.lower()
                         actual_table = alias_to_table_map.get(table_ref)
-
-                        # If it maps to a known, non-CTE table, extract literal values
+    
                         if actual_table and actual_table in table_details:
                             for val_node in value_nodes:
-                                # Extract the literal value (remove quotes if string)
                                 if isinstance(val_node, (exp.String, exp.Literal)):
-                                    # sqlglot's literal_value handles type conversion if needed
-                                    extracted_value = str(val_node.literal_value) # Ensure string
+                                    extracted_value = str(val_node.literal_value)
                                     table_details[actual_table]['source_codes'].add(extracted_value)
                                     logging.debug(f"Found source code: {actual_table}.{col_name_upper} -> {extracted_value}")
-
-
-            # --- 5. Final Filtering and Formatting ---
-            # Filter out tables that ended up with no columns or source codes
+    
+            # --- 5. Propagate CTE Metadata ---
+            for cte_name in cte_names:
+                if cte_name in alias_to_table_map:
+                    actual_table = alias_to_table_map[cte_name]
+                    if actual_table in table_details:
+                        table_details[actual_table]['columns'].update(table_details[cte_name]['columns'])
+                        table_details[actual_table]['source_codes'].update(table_details[cte_name]['source_codes'])
+    
+            # --- 6. Final Formatting ---
             final_result = {
                 table: data for table, data in table_details.items()
                 if data['columns'] or data['source_codes']
             }
-
-            # Convert sets to sorted lists for consistent output
             for table_data in final_result.values():
-                 table_data['columns'] = sorted(list(table_data['columns']))
-                 table_data['source_codes'] = sorted(list(table_data['source_codes']))
-
+                table_data['columns'] = sorted(list(table_data['columns']))
+                table_data['source_codes'] = sorted(list(table_data['source_codes']))
+    
             logging.debug(f"Final extracted metadata: {final_result}")
             return final_result
-
+    
         except Exception as e:
-            # Catch-all for unexpected errors during processing
             logger.error(f"Unexpected error processing SQL query: {e}\nQuery: {sql_str[:500]}...", exc_info=True)
             return {}
 
