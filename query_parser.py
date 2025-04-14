@@ -209,7 +209,11 @@ class SQLMetadataExtractor:
                 actual_table = self.alias_map.get(table_ref, table_ref)
                 print(f"Actual table: {actual_table}")
                 
-                if actual_table in table_source_codes:
+                # Clean the table name to match the format in result dictionary
+                clean_table = actual_table.split('.')[-1].strip('`"[] ').lower()
+                print(f"Clean table name: {clean_table}")
+                
+                if clean_table in table_source_codes:
                     # Extract all values between quotes or as standalone words
                     values = re.findall(r"'([^']*)'|([^,\s]+)", values_str)
                     print(f"Raw values found: {values}")
@@ -229,9 +233,9 @@ class SQLMetadataExtractor:
                             print(f"Adding cleaned value: {value}")
                     
                     # Update source codes for the table
-                    print(f"Current source codes for {actual_table}: {sorted(list(table_source_codes[actual_table]))}")
-                    table_source_codes[actual_table].update(cleaned_values)
-                    print(f"Updated source codes for {actual_table}: {sorted(list(table_source_codes[actual_table]))}")
+                    print(f"Current source codes for {clean_table}: {sorted(list(table_source_codes[clean_table]))}")
+                    table_source_codes[clean_table].update(cleaned_values)
+                    print(f"Updated source codes for {clean_table}: {sorted(list(table_source_codes[clean_table]))}")
             
             # Process equals operator matches
             equals_matches = re.finditer(equals_pattern, sql)
@@ -247,14 +251,18 @@ class SQLMetadataExtractor:
                 actual_table = self.alias_map.get(table_ref, table_ref)
                 print(f"Actual table: {actual_table}")
                 
-                if actual_table in table_source_codes:
+                # Clean the table name to match the format in result dictionary
+                clean_table = actual_table.split('.')[-1].strip('`"[] ').lower()
+                print(f"Clean table name: {clean_table}")
+                
+                if clean_table in table_source_codes:
                     # Clean and validate the value
                     value = value.strip().strip("'\"")
                     if value and value.upper() not in {'AND', 'OR', 'IN', 'NOT', 'NULL', 'TRUE', 'FALSE'}:
                         print(f"Adding cleaned value: {value}")
-                        print(f"Current source codes for {actual_table}: {sorted(list(table_source_codes[actual_table]))}")
-                        table_source_codes[actual_table].add(value)
-                        print(f"Updated source codes for {actual_table}: {sorted(list(table_source_codes[actual_table]))}")
+                        print(f"Current source codes for {clean_table}: {sorted(list(table_source_codes[clean_table]))}")
+                        table_source_codes[clean_table].add(value)
+                        print(f"Updated source codes for {clean_table}: {sorted(list(table_source_codes[clean_table]))}")
             
             # CTE pattern for IN clause
             cte_in_pattern = fr'''(?ix)            # Case insensitive and verbose mode
