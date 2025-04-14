@@ -267,59 +267,37 @@ class SQLMetadataExtractor:
         print(f"Final columns for {table_name}: {columns}")
         return columns
 
-    def _extract_source_codes(self, sql: str, table_name: str, alias_list: List[str]) -> Set[str]:
-        """Extract source codes from specific columns."""
+    def _extract_source_codes(self, query: str, table_name: str, alias_list: List[str]) -> Set[str]:
+        """Extract source codes from the query for a specific table."""
         source_codes = set()
-
-        for col in self.source_code_columns:
-            # Handle IN clauses with better subquery detection
-            in_pattern = fr'(?i)(\w+)\.{col}\s*IN\s*\(([^)]+)\)(?![^()]*\bSELECT\b)'
-            in_matches = re.finditer(in_pattern, sql)
-            for match in in_matches:
-                table_ref = match.group(1).lower()
-                values_str = match.group(2)
-                actual_table = self.alias_map.get(table_ref, table_ref)
-
-                if actual_table in alias_list:
-                    # Skip if the IN clause contains a SELECT (subquery)
-                    if 'SELECT' in values_str.upper():
-                        continue
-                    # Extract values from IN clause, handling newlines, spaces, and nested parentheses
-                    values = []
-                    current_value = []
-                    paren_count = 0
-                    for char in values_str:
-                        if char == '(':
-                            paren_count += 1
-                        elif char == ')':
-                            paren_count -= 1
-                        elif char == ',' and paren_count == 0:
-                            if current_value:
-                                value = ''.join(current_value).strip(" '\n\t")
-                                if value:
-                                    values.append(value)
-                                current_value = []
-                            continue
-                        current_value.append(char)
-                    
-                    if current_value:
-                        value = ''.join(current_value).strip(" '\n\t")
-                        if value:
-                            values.append(value)
-                    
-                    source_codes.update(values)
-
-            # Handle = operator with better value extraction
-            equals_pattern = fr'(?i)(\w+)\.{col}\s*=\s*\'([^\']+)\'(?![^()]*\bSELECT\b)'
-            equals_matches = re.finditer(equals_pattern, sql)
-            for match in equals_matches:
-                table_ref = match.group(1).lower()
-                value = match.group(2)
-                actual_table = self.alias_map.get(table_ref, table_ref)
-
-                if actual_table in alias_list:
-                    source_codes.add(value.strip())
-
+        print(f"\nExtracting source codes for table: {table_name}")
+        print(f"Using aliases: {alias_list}")
+        
+        # Pattern to match source code values in WHERE, JOIN, and CASE conditions
+        source_code_pattern = r'(?i)(?:WHERE|AND|OR|ON|WHEN)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]'
+        print(f"Searching for source codes with pattern: {source_code_pattern}")
+        
+        matches = re.finditer(source_code_pattern, query)
+        for match in matches:
+            source_code = match.group(1)
+            print(f"Found source code: {source_code}")
+            source_codes.add(source_code)
+            
+        # Also check for IN clauses with source codes
+        in_pattern = r'(?i)(?:WHERE|AND|OR|ON)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s+IN\s*\(([^)]+)\)'
+        print(f"Searching for IN clauses with pattern: {in_pattern}")
+        
+        in_matches = re.finditer(in_pattern, query)
+        for match in in_matches:
+            in_values = match.group(1)
+            print(f"Found IN clause values: {in_values}")
+            # Extract individual values from the IN clause
+            values = re.findall(r'[\'"]([^\'"]+)[\'"]', in_values)
+            for value in values:
+                print(f"Found source code in IN clause: {value}")
+                source_codes.add(value)
+                
+        print(f"Final source codes for {table_name}: {source_codes}")
         return source_codes
 
     def _update_master_dict(self, current_metadata: Dict[str, Dict[str, Set[str]]]):
