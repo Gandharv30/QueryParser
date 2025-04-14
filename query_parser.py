@@ -55,9 +55,17 @@ class SQLMetadataExtractor:
             source_codes = self._extract_source_codes(sql, tables)
             print("\nSource codes after extraction:")
             for table, codes in source_codes.items():
-                if table in result:
+                if table in result and table not in self.cte_names:
                     result[table][1].update(codes)
                     print(f"Table {table} source codes: {sorted(list(codes))}")
+
+            # Final verification to ensure no CTEs are in the result
+            result = {k: v for k, v in result.items() if k not in self.cte_names}
+            print("\nFinal result after CTE filtering:")
+            for table, (cols, codes) in result.items():
+                print(f"Table {table}:")
+                print(f"  Columns: {sorted(list(cols))}")
+                print(f"  Source codes: {sorted(list(codes))}")
 
             return result
 
@@ -67,16 +75,42 @@ class SQLMetadataExtractor:
 
     def _extract_ctes(self, sql: str):
         """Extract CTE names from WITH clause."""
-        cte_pattern = r'(?i)WITH\s+([^\s(]+)'
-        matches = re.finditer(cte_pattern, sql)
-        for match in matches:
-            cte_name = match.group(1).lower()
-            self.cte_names.add(cte_name)
+        # First, find the WITH clause
+        with_clause_pattern = r'(?i)WITH\s+(?:RECURSIVE\s+)?([^;]+?)(?=\s+SELECT\s+(?:c1\.|c2\.|[^.]))'
+        with_match = re.search(with_clause_pattern, sql, re.DOTALL)
+        
+        if with_match:
+            cte_block = with_match.group(1)
+            
+            # Pattern to match each CTE definition, handling nested parentheses
+            cte_pattern = r'(?i)(\w+)\s+AS\s*\('
+            
+            # Find all CTE names
+            cte_matches = re.finditer(cte_pattern, cte_block)
+            for match in cte_matches:
+                cte_name = match.group(1).lower().strip()
+                self.cte_names.add(cte_name)
+                print(f"Found CTE: {cte_name}")
+            
+            print(f"All CTEs found in WITH clause: {self.cte_names}")
+            
+            # Find all references to CTEs in the main query
+            for cte_name in self.cte_names:
+                ref_pattern = fr'(?i)(?:FROM|JOIN)\s+{cte_name}\s+(?:AS\s+)?(\w+)'
+                ref_matches = re.finditer(ref_pattern, sql)
+                for ref_match in ref_matches:
+                    alias = ref_match.group(1).lower().strip()
+                    self.alias_map[alias] = cte_name
+                    print(f"Found CTE reference: {cte_name} with alias {alias}")
 
     def _extract_tables_and_aliases(self, sql: str) -> List[str]:
         """Extract table names and their aliases."""
         parser = Parser(sql)
         tables = []
+
+        # First, extract all CTEs to ensure we can properly exclude them
+        self._extract_ctes(sql)
+        print(f"\nAll CTEs found: {self.cte_names}")
 
         # Process each table and its alias
         for table, alias in parser.tables_aliases.items():
@@ -84,14 +118,17 @@ class SQLMetadataExtractor:
             table_name = table.split('.')[-1].strip('`"[] ').lower()
             table_alias = alias.split('.')[-1].strip('`"[] ').lower()
             
-            # Skip CTEs
-            if table_name in self.cte_names:
+            # Skip if this is a CTE or a reference to a CTE
+            if table_name in self.cte_names or table_alias in self.cte_names or any(cte in table_name for cte in self.cte_names):
+                print(f"Skipping CTE or CTE reference: {table_name} (alias: {table_alias})")
                 continue
 
-            # Add the actual table name to our list
-            tables.append(table_name)
-            # Map the alias to the actual table name
-            self.alias_map[table_alias] = table_name
+            # Add the actual table name to our list if it's not already there
+            if table_name not in tables:
+                tables.append(table_name)
+                # Map the alias to the actual table name
+                self.alias_map[table_alias] = table_name
+                print(f"Added table: {table_name} with alias: {table_alias}")
 
         # Also extract tables from FROM and JOIN clauses to catch any missed tables
         table_pattern = r'(?i)(?:FROM|JOIN)\s+([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?'
@@ -104,11 +141,19 @@ class SQLMetadataExtractor:
             clean_table = table.split('.')[-1].strip('`"[] ').lower()
             clean_alias = alias.split('.')[-1].strip('`"[] ').lower()
             
-            if clean_table not in self.cte_names and clean_table not in tables:
-                tables.append(clean_table)
-                self.alias_map[clean_alias] = clean_table
+            # Skip if this is a CTE or a reference to a CTE or already processed
+            if (clean_table in self.cte_names or 
+                clean_alias in self.cte_names or 
+                clean_table in tables or
+                any(cte in clean_table for cte in self.cte_names)):
+                print(f"Skipping CTE or duplicate table: {clean_table} (alias: {clean_alias})")
+                continue
+                
+            tables.append(clean_table)
+            self.alias_map[clean_alias] = clean_table
+            print(f"Added table from FROM/JOIN: {clean_table} with alias: {clean_alias}")
 
-        return tables
+        return [t for t in tables if t not in self.cte_names]
 
     def _extract_columns(self, sql: str, result: Dict[str, List[Set]]):
         """Extract columns for each table."""
