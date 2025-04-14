@@ -17,7 +17,6 @@ class SQLMetadataExtractor:
 
     def _extract_sql_metadata(self, sql: str) -> Dict[str, List[Set]]:
         """Extract table names, columns, and source codes from SQL query."""
-        print("\n=== Starting SQL metadata extraction ===")
         if not isinstance(sql, str):
             raise ValueError("Input must be a string")
 
@@ -33,39 +32,26 @@ class SQLMetadataExtractor:
 
             # First, extract CTEs to exclude them
             self._extract_ctes(sql)
-            print(f"\nCTEs found: {self.cte_names}")
 
             # Extract tables and their aliases
             tables = self._extract_tables_and_aliases(sql)
-            print(f"\nTables found: {tables}")
 
             # Initialize result dictionary (excluding CTEs)
             for table in tables:
                 if table not in self.cte_names:
                     result[table] = [set(), set()]  # [columns, source_codes]
-                    print(f"Initialized result for table: {table}")
 
             # Extract columns for each table
             self._extract_columns(sql, result)
-            print("\nColumns after extraction:")
-            for table, (cols, _) in result.items():
-                print(f"Table {table} columns: {sorted(list(cols))}")
 
             # Extract source codes
             source_codes = self._extract_source_codes(sql, tables)
-            print("\nSource codes after extraction:")
             for table, codes in source_codes.items():
                 if table in result and table not in self.cte_names:
                     result[table][1].update(codes)
-                    print(f"Table {table} source codes: {sorted(list(codes))}")
 
             # Final verification to ensure no CTEs are in the result
             result = {k: v for k, v in result.items() if k not in self.cte_names}
-            print("\nFinal result after CTE filtering:")
-            for table, (cols, codes) in result.items():
-                print(f"Table {table}:")
-                print(f"  Columns: {sorted(list(cols))}")
-                print(f"  Source codes: {sorted(list(codes))}")
 
             return result
 
@@ -76,23 +62,20 @@ class SQLMetadataExtractor:
     def _extract_ctes(self, sql: str):
         """Extract CTE names from WITH clause."""
         # First, find the WITH clause
-        with_clause_pattern = r'(?i)WITH\s+(?:RECURSIVE\s+)?([^;]+?)(?=\s+SELECT\s+(?:c1\.|c2\.|[^.]))'
+        with_clause_pattern = r'(?i)WITH\s+(?:RECURSIVE\s+)?(.+?)(?=\s+SELECT\s+(?!.*\bAS\s*\())'
         with_match = re.search(with_clause_pattern, sql, re.DOTALL)
         
         if with_match:
             cte_block = with_match.group(1)
             
             # Pattern to match each CTE definition, handling nested parentheses
-            cte_pattern = r'(?i)(\w+)\s+AS\s*\('
+            cte_pattern = r'(?i)(?:^|,)\s*([^\s,(]+)\s+AS\s*\('
             
             # Find all CTE names
             cte_matches = re.finditer(cte_pattern, cte_block)
             for match in cte_matches:
                 cte_name = match.group(1).lower().strip()
                 self.cte_names.add(cte_name)
-                print(f"Found CTE: {cte_name}")
-            
-            print(f"All CTEs found in WITH clause: {self.cte_names}")
             
             # Find all references to CTEs in the main query
             for cte_name in self.cte_names:
@@ -101,7 +84,6 @@ class SQLMetadataExtractor:
                 for ref_match in ref_matches:
                     alias = ref_match.group(1).lower().strip()
                     self.alias_map[alias] = cte_name
-                    print(f"Found CTE reference: {cte_name} with alias {alias}")
 
     def _extract_tables_and_aliases(self, sql: str) -> List[str]:
         """Extract table names and their aliases."""
@@ -110,7 +92,6 @@ class SQLMetadataExtractor:
 
         # First, extract all CTEs to ensure we can properly exclude them
         self._extract_ctes(sql)
-        print(f"\nAll CTEs found: {self.cte_names}")
 
         # Process each table and its alias
         for table, alias in parser.tables_aliases.items():
@@ -119,8 +100,10 @@ class SQLMetadataExtractor:
             table_alias = alias.split('.')[-1].strip('`"[] ').lower()
             
             # Skip if this is a CTE or a reference to a CTE
-            if table_name in self.cte_names or table_alias in self.cte_names or any(cte in table_name for cte in self.cte_names):
-                print(f"Skipping CTE or CTE reference: {table_name} (alias: {table_alias})")
+            if (table_name in self.cte_names or 
+                table_alias in self.cte_names or 
+                any(cte in table_name for cte in self.cte_names) or
+                any(cte in table_alias for cte in self.cte_names)):
                 continue
 
             # Add the actual table name to our list if it's not already there
@@ -128,7 +111,6 @@ class SQLMetadataExtractor:
                 tables.append(table_name)
                 # Map the alias to the actual table name
                 self.alias_map[table_alias] = table_name
-                print(f"Added table: {table_name} with alias: {table_alias}")
 
         # Also extract tables from FROM and JOIN clauses to catch any missed tables
         table_pattern = r'(?i)(?:FROM|JOIN)\s+([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?'
@@ -145,15 +127,21 @@ class SQLMetadataExtractor:
             if (clean_table in self.cte_names or 
                 clean_alias in self.cte_names or 
                 clean_table in tables or
-                any(cte in clean_table for cte in self.cte_names)):
-                print(f"Skipping CTE or duplicate table: {clean_table} (alias: {clean_alias})")
+                any(cte in clean_table for cte in self.cte_names) or
+                any(cte in clean_alias for cte in self.cte_names)):
                 continue
                 
             tables.append(clean_table)
             self.alias_map[clean_alias] = clean_table
-            print(f"Added table from FROM/JOIN: {clean_table} with alias: {clean_alias}")
 
-        return [t for t in tables if t not in self.cte_names]
+        # Filter out any remaining CTEs from the tables list
+        filtered_tables = []
+        for table in tables:
+            if (table not in self.cte_names and 
+                not any(cte in table for cte in self.cte_names)):
+                filtered_tables.append(table)
+        
+        return filtered_tables
 
     def _extract_columns(self, sql: str, result: Dict[str, List[Set]]):
         """Extract columns for each table."""
@@ -175,15 +163,12 @@ class SQLMetadataExtractor:
             # Only process if it's an actual table and exists in our result
             if actual_table in result:
                 result[actual_table][0].add(column)
-                print(f"Added column {column} to table {actual_table}")
 
     def _extract_source_codes(self, sql: str, tables: List[str]) -> Dict[str, Set]:
         """Extract source codes from specific columns."""
         source_codes = {table: set() for table in tables if table not in self.cte_names}
 
         for col in self.source_code_columns:
-            print(f"\nProcessing column: {col}")
-
             # Handle IN clauses
             in_pattern = fr'(?i)(\w+)\.{col}\s*IN\s*\(([^)]+)\)'
             in_matches = re.finditer(in_pattern, sql)
@@ -193,10 +178,12 @@ class SQLMetadataExtractor:
                 actual_table = self.alias_map.get(table_ref, table_ref)
 
                 if actual_table in source_codes:
+                    # Skip if the IN clause contains a SELECT (subquery)
+                    if 'SELECT' in values_str.upper():
+                        continue
                     # Extract values from IN clause
                     values = {v.strip(" '") for v in values_str.split(',') if v.strip()}
                     source_codes[actual_table].update(values)
-                    print(f"Added IN values for {actual_table}: {values}")
 
             # Handle = operator
             equals_pattern = fr'(?i)(\w+)\.{col}\s*=\s*\'([^\']+)\''
@@ -208,7 +195,6 @@ class SQLMetadataExtractor:
 
                 if actual_table in source_codes:
                     source_codes[actual_table].add(value)
-                    print(f"Added = value for {actual_table}: {value}")
 
         return source_codes
 
@@ -242,18 +228,29 @@ class SQLMetadataExtractor:
         return self.master_dict
 
 def test_queries():
-    """Test the SQL metadata extraction with various cases."""
+    """Test the SQL metadata extraction with various CTE cases."""
     extractor = SQLMetadataExtractor()
     
     test_cases = [
         {
-            "name": "Source Code Pattern Test",
+            "name": "Basic CTE Test",
             "sql": """
                 WITH cte1 AS (
                     SELECT t1.col1, t1.data_srce_cde
                     FROM table1 t1
-                    WHERE t1.data_srce_cde IN ('A1', 'B2',
-                        'C3')
+                    WHERE t1.data_srce_cde IN ('A1', 'B2')
+                )
+                SELECT c1.*
+                FROM cte1 c1
+            """
+        },
+        {
+            "name": "Multiple CTEs Test",
+            "sql": """
+                WITH cte1 AS (
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde IN ('A1', 'B2')
                 ),
                 cte2 AS (
                     SELECT t2.col1, t2.ar_srce_cde
@@ -263,44 +260,99 @@ def test_queries():
                 SELECT c1.*, c2.*
                 FROM cte1 c1
                 JOIN cte2 c2 ON c1.col1 = c2.col1
-                WHERE c2.ar_srce_cde IN ('Y2',
-                    'Z3')
             """
         },
         {
-            "name": "Mixed Operators Test",
+            "name": "Recursive CTE Test",
             "sql": """
-                SELECT *
-                FROM table3 t3
-                WHERE t3.data_srce_cde = 'ABC'
-                AND t3.ar_srce_cde IN (
-                    'DEF',
-                    'GHI'
+                WITH RECURSIVE cte1 AS (
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde = 'A1'
+                    UNION ALL
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    JOIN cte1 c ON t1.col1 = c.col1
                 )
+                SELECT c1.*
+                FROM cte1 c1
             """
         },
         {
-            "name": "Multiple Equals Test",
+            "name": "Nested CTEs Test",
             "sql": """
-                SELECT *
-                FROM table4 t4
-                WHERE t4.data_srce_cde = 'XYZ'
-                UNION ALL
-                SELECT *
-                FROM table5 t5
-                WHERE t5.ar_srce_cde = 
-                    'MNO'
+                WITH cte1 AS (
+                    WITH cte2 AS (
+                        SELECT t1.col1, t1.data_srce_cde
+                        FROM table1 t1
+                        WHERE t1.data_srce_cde = 'A1'
+                    )
+                    SELECT c2.*
+                    FROM cte2 c2
+                )
+                SELECT c1.*
+                FROM cte1 c1
+            """
+        },
+        {
+            "name": "CTE with Multiple References Test",
+            "sql": """
+                WITH cte1 AS (
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde = 'A1'
+                )
+                SELECT c1.*, c2.*
+                FROM cte1 c1
+                JOIN cte1 c2 ON c1.col1 = c2.col1
+            """
+        },
+        {
+            "name": "CTE with Complex Joins Test",
+            "sql": """
+                WITH cte1 AS (
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde = 'A1'
+                ),
+                cte2 AS (
+                    SELECT t2.col1, t2.ar_srce_cde
+                    FROM table2 t2
+                    WHERE t2.ar_srce_cde = 'X1'
+                ),
+                cte3 AS (
+                    SELECT c1.col1, c2.ar_srce_cde
+                    FROM cte1 c1
+                    JOIN cte2 c2 ON c1.col1 = c2.col1
+                )
+                SELECT c3.*
+                FROM cte3 c3
+            """
+        },
+        {
+            "name": "CTE with Subqueries Test",
+            "sql": """
+                WITH cte1 AS (
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde IN (
+                        SELECT t2.data_srce_cde
+                        FROM table2 t2
+                        WHERE t2.ar_srce_cde = 'X1'
+                    )
+                )
+                SELECT c1.*
+                FROM cte1 c1
             """
         }
     ]
     
     for test in test_cases:
-        print(f"\n=== Running Test: {test['name']} ===")
-        print("\nSQL Query:")
-        print(test['sql'])
-        
         try:
             result = extractor._extract_sql_metadata(test['sql'])
+            print(f"\n=== Running Test: {test['name']} ===")
+            print("\nSQL Query:")
+            print(test['sql'])
             print("\nExtracted Metadata:")
             for table, metadata in result.items():
                 print(f"\nTable: {table}")
