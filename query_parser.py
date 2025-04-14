@@ -144,111 +144,90 @@ class SQLMetadataExtractor:
             clean_table = table.split('.')[-1].strip('`"[] ').lower()
             table_source_codes[clean_table] = set()
         
-        # Extract source codes using comprehensive patterns
+        # Extract source codes using simpler patterns
         for col in self.source_code_columns:
-            # Main pattern for IN clause - case insensitive, handles newlines
-            in_pattern = fr'''(?ix)                 # Case insensitive and verbose mode
-                (?:FROM|JOIN|WHERE|AND|OR|\()\s*   # SQL keywords or opening parenthesis
-                (?:(\w+)\.)?                       # Optional schema
-                (\w+)                              # Table name or alias
-                \.{col}                            # Column name
-                (?:\s|\n)*IN(?:\s|\n)*            # IN keyword with optional whitespace/newlines
-                \(                                 # Opening parenthesis
-                (?:\s|\n)*                         # Optional whitespace/newlines
-                (                                  # Start capturing values
-                    (?:                           # Start group for first value
-                        '(?:[^']|'')*'            # Quoted value (handles escaped quotes)
-                        (?:                       # Start group for additional values
-                            (?:\s|\n)*,(?:\s|\n)* # Comma with optional whitespace/newlines
-                            '(?:[^']|'')*'        # Additional quoted value
-                        )*                        # Zero or more additional values
-                    )                             # End value group
-                )                                 # End capturing values
-                (?:\s|\n)*                        # Optional whitespace/newlines
-                \)                                # Closing parenthesis
-            '''
+            print(f"\nProcessing column: {col}")
             
-            # Pattern for single value with = operator - case insensitive
-            equals_pattern = fr'''(?ix)            # Case insensitive and verbose mode
-                (?:FROM|JOIN|WHERE|AND|OR|\()\s*  # SQL keywords or opening parenthesis
-                (?:(\w+)\.)?                      # Optional schema
-                (\w+)                             # Table name or alias
-                \.{col}                           # Column name
-                (?:\s|\n)*=(?:\s|\n)*            # Equals operator with optional whitespace/newlines
-                '([^']*)'                         # Single quoted value
-            '''
-            
-            # Process IN clause matches
+            # First find all instances of the column followed by IN clause
+            in_pattern = fr'(?i)(\w+)\.{col}\s*(?:\n|\s)*IN\s*\('
             in_matches = re.finditer(in_pattern, sql)
-            for match in in_matches:
-                schema, table_ref, values_str = match.groups()
-                table_ref = table_ref.lower() if table_ref else ''
-                
-                # Get actual table name from alias if exists
-                actual_table = self.alias_map.get(table_ref, table_ref)
-                
-                if actual_table in table_source_codes:
-                    # Extract all quoted values
-                    values = []
-                    # Match all quoted values, handling newlines and whitespace
-                    quoted_pattern = r"'((?:[^']|'')+)'"  # Handle escaped quotes
-                    quoted_values = re.findall(quoted_pattern, values_str)
-                    values.extend([v.strip() for v in quoted_values])
-                    
-                    # Update source codes for the table
-                    table_source_codes[actual_table].update(values)
             
-            # Process equals operator matches
+            for col_match in in_matches:
+                table_ref = col_match.group(1).lower()
+                start_pos = col_match.end()
+                print(f"\nFound {col} IN reference for table/alias: {table_ref}")
+                print(f"Starting position after IN(: {start_pos}")
+                
+                # Find the matching closing parenthesis
+                open_count = 1
+                pos = start_pos
+                while open_count > 0 and pos < len(sql):
+                    if sql[pos] == '(':
+                        open_count += 1
+                    elif sql[pos] == ')':
+                        open_count -= 1
+                    pos += 1
+                
+                if open_count == 0:
+                    # Extract everything between the parentheses
+                    values_str = sql[start_pos:pos-1].strip()
+                    print(f"Extracted IN values string: {values_str}")
+                    
+                    # Split by comma and clean up each value
+                    values = []
+                    current_value = ''
+                    in_quotes = False
+                    
+                    for char in values_str:
+                        if char == "'":
+                            in_quotes = not in_quotes
+                            current_value += char
+                        elif char == ',' and not in_quotes:
+                            if current_value:
+                                clean_value = current_value.strip(" '\t\n")
+                                if clean_value:
+                                    values.append(clean_value)
+                                current_value = ''
+                        else:
+                            current_value += char
+                    
+                    # Don't forget the last value
+                    if current_value:
+                        clean_value = current_value.strip(" '\t\n")
+                        if clean_value:
+                            values.append(clean_value)
+                    
+                    print(f"Parsed IN values: {values}")
+                    
+                    # Get actual table name from alias if exists
+                    actual_table = self.alias_map.get(table_ref, table_ref)
+                    print(f"Actual table name: {actual_table}")
+                    
+                    if actual_table in table_source_codes:
+                        table_source_codes[actual_table].update(values)
+                        print(f"Updated source codes for {actual_table} from IN: {table_source_codes[actual_table]}")
+            
+            # Now handle the equals operator
+            equals_pattern = fr'(?i)(\w+)\.{col}\s*(?:\n|\s)*=\s*(?:\n|\s)*\'([^\']+)\''
             equals_matches = re.finditer(equals_pattern, sql)
-            for match in equals_matches:
-                schema, table_ref, value = match.groups()
-                table_ref = table_ref.lower() if table_ref else ''
+            
+            for eq_match in equals_matches:
+                table_ref = eq_match.group(1).lower()
+                value = eq_match.group(2)
+                print(f"\nFound {col} = reference for table/alias: {table_ref}")
+                print(f"Extracted = value: {value}")
                 
                 # Get actual table name from alias if exists
                 actual_table = self.alias_map.get(table_ref, table_ref)
+                print(f"Actual table name: {actual_table}")
                 
                 if actual_table in table_source_codes:
-                    # Add the single value
-                    table_source_codes[actual_table].add(value.strip())
-            
-            # CTE pattern for IN clause - case insensitive
-            cte_in_pattern = fr'''(?ix)            # Case insensitive and verbose mode
-                WITH\s+(?:RECURSIVE\s+)?           # WITH or WITH RECURSIVE
-                (?:.*?,\s*)*                       # Any preceding CTEs
-                (\w+)                              # CTE name
-                (?:\s+AS\s+)?\s*\(                # Optional AS and opening parenthesis
-                (?:[^()]|\([^()]*\))*?            # Non-greedy match of content
-                {col}                              # Column name
-                (?:\s|\n)*IN(?:\s|\n)*            # IN keyword with optional whitespace/newlines
-                \(                                 # Opening parenthesis
-                (?:\s|\n)*                         # Optional whitespace/newlines
-                (                                  # Start capturing values
-                    (?:                           # Start group for first value
-                        '(?:[^']|'')*'            # Quoted value (handles escaped quotes)
-                        (?:                       # Start group for additional values
-                            (?:\s|\n)*,(?:\s|\n)* # Comma with optional whitespace/newlines
-                            '(?:[^']|'')*'        # Additional quoted value
-                        )*                        # Zero or more additional values
-                    )                             # End value group
-                )                                 # End capturing values
-                (?:\s|\n)*                        # Optional whitespace/newlines
-                \)                                # Closing parenthesis
-            '''
-            
-            # Process CTE IN clause matches
-            cte_in_matches = re.finditer(cte_in_pattern, sql)
-            for match in cte_in_matches:
-                cte_name = match.group(1).lower()
-                values_str = match.group(2) if len(match.groups()) > 1 else ''
-                
-                if cte_name in table_source_codes:
-                    # Extract values using the same patterns
-                    values = []
-                    quoted_pattern = r"'((?:[^']|'')+)'"  # Handle escaped quotes
-                    quoted_values = re.findall(quoted_pattern, values_str)
-                    values.extend([v.strip() for v in quoted_values])
-                    
-                    table_source_codes[cte_name].update(values)
+                    table_source_codes[actual_table].add(value)
+                    print(f"Updated source codes for {actual_table} from =: {table_source_codes[actual_table]}")
+        
+        print("\nFinal table source codes:")
+        for table, codes in table_source_codes.items():
+            print(f"{table}: {codes}")
         
         return table_source_codes
 
@@ -479,6 +458,20 @@ def test_queries():
                 t1.data_srce_cde 
                 IN ('AF','BC','CA')
             AND t2.ar_srce_cde IN ('X1','Y2', 'Z3')
+            AND t2.data_srce_cde = 'D1';
+            """
+        },
+        {
+            "name": "Equals with Newlines Test",
+            "query": """
+            SELECT t1.*, t2.column1
+            FROM table1 t1
+            JOIN table2 t2 ON t1.id = t2.id
+            WHERE 
+                t1.data_srce_cde 
+                = 'AF'
+            AND t2.ar_srce_cde 
+                = 'X1'
             AND t2.data_srce_cde = 'D1';
             """
         }
