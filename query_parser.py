@@ -80,15 +80,33 @@ class SQLMetadataExtractor:
 
         # Process each table and its alias
         for table, alias in parser.tables_aliases.items():
+            # Get the actual table name (before the alias)
+            table_name = table.split('.')[-1].strip('`"[] ').lower()
+            table_alias = alias.split('.')[-1].strip('`"[] ').lower()
+            
+            # Skip CTEs
+            if table_name in self.cte_names:
+                continue
+
+            # Add the actual table name to our list
+            tables.append(table_name)
+            # Map the alias to the actual table name
+            self.alias_map[table_alias] = table_name
+
+        # Also extract tables from FROM and JOIN clauses to catch any missed tables
+        table_pattern = r'(?i)(?:FROM|JOIN)\s+([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?'
+        matches = re.finditer(table_pattern, sql)
+        
+        for match in matches:
+            table = match.group(1)
+            alias = match.group(2) if match.group(2) else table
+            
             clean_table = table.split('.')[-1].strip('`"[] ').lower()
             clean_alias = alias.split('.')[-1].strip('`"[] ').lower()
             
-            # Skip CTEs
-            if clean_table in self.cte_names:
-                continue
-
-            tables.append(clean_table)
-            self.alias_map[clean_alias] = clean_table
+            if clean_table not in self.cte_names and clean_table not in tables:
+                tables.append(clean_table)
+                self.alias_map[clean_alias] = clean_table
 
         return tables
 
