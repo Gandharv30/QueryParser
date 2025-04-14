@@ -1,6 +1,6 @@
 import pandas as pd
 from sql_metadata import Parser
-from typing import Dict, Set, List
+from typing import Dict, Set, List, Any, Optional
 import re
 import logging
 
@@ -10,85 +10,180 @@ logger = logging.getLogger(__name__)
 
 class SQLMetadataExtractor:
     def __init__(self):
-        self.source_code_columns = ['AR_SRCE_CDE', 'DATA_SRCE_CDE']
-        self.master_dict = {}
-        self.alias_map = {}
-        self.cte_names = set()
+        self.source_code_columns: List[str] = ['AR_SRCE_CDE', 'DATA_SRCE_CDE']
+        self.master_dict: Dict[str, Dict[str, List[str]]] = {}
+        self.alias_map: Dict[str, str] = {}
+        self.cte_names: Set[str] = set()
+        self.table_aliases: Dict[str, str] = {}
 
-    def _extract_sql_metadata(self, sql: str) -> Dict[str, List[Set]]:
-        """Extract table names, columns, and source codes from SQL query."""
-        if not isinstance(sql, str):
-            raise ValueError("Input must be a string")
-
-        sql = sql.strip()
-        if not sql.endswith(';'):
-            sql = sql + ';'
-
-        try:
-            # Reset state for new query
-            self.alias_map = {}
-            self.cte_names = set()
-            result = {}
-
-            # First, extract CTEs to exclude them
-            self._extract_ctes(sql)
-
-            # Extract tables and their aliases
-            tables = self._extract_tables_and_aliases(sql)
-
-            # Initialize result dictionary (excluding CTEs)
-            for table in tables:
-                if table not in self.cte_names:
-                    result[table] = [set(), set()]  # [columns, source_codes]
-
-            # Extract columns for each table
-            self._extract_columns(sql, result)
-
-            # Extract source codes
-            source_codes = self._extract_source_codes(sql, tables)
-            for table, codes in source_codes.items():
-                if table in result and table not in self.cte_names:
-                    result[table][1].update(codes)
-
-            # Final verification to ensure no CTEs are in the result
-            result = {k: v for k, v in result.items() if k not in self.cte_names}
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Error processing query: {str(e)}")
+    def _extract_sql_metadata(self, sql_str: str) -> Dict[str, Dict[str, List[str]]]:
+        """
+        Extract metadata from SQL query including tables, columns, and source codes.
+        """
+        if not sql_str or not isinstance(sql_str, str):
             return {}
 
-    def _extract_ctes(self, sql: str):
-        """Extract CTE names from WITH clause."""
-        # First, find the WITH clause
-        with_clause_pattern = r'(?i)WITH\s+(?:RECURSIVE\s+)?(.+?)(?=\s+SELECT\s+(?!.*\bAS\s*\())'
-        with_match = re.search(with_clause_pattern, sql, re.DOTALL)
-        
-        if with_match:
-            cte_block = with_match.group(1)
-            
-            # Pattern to match each CTE definition, handling nested parentheses
-            cte_pattern = r'(?i)(?:^|,)\s*([^\s,(]+)\s+AS\s*\('
-            
-            # Find all CTE names
-            cte_matches = re.finditer(cte_pattern, cte_block)
-            for match in cte_matches:
-                cte_name = match.group(1).lower().strip()
-                self.cte_names.add(cte_name)
-            
-            # Find all references to CTEs in the main query
-            for cte_name in self.cte_names:
-                ref_pattern = fr'(?i)(?:FROM|JOIN)\s+{cte_name}\s+(?:AS\s+)?(\w+)'
-                ref_matches = re.finditer(ref_pattern, sql)
-                for ref_match in ref_matches:
-                    alias = ref_match.group(1).lower().strip()
-                    self.alias_map[alias] = cte_name
+        # Extract CTEs first to exclude them from results
+        ctes = self._extract_ctes(sql_str)
+        logging.debug(f"Found CTEs: {ctes}")
 
-    def _extract_tables_and_aliases(self, sql: str) -> List[str]:
-        """Extract table names and their aliases."""
+        # Extract tables and their aliases
+        tables_and_aliases = self._extract_tables_and_aliases(sql_str)
+        logging.debug(f"Found tables and aliases: {tables_and_aliases}")
+
+        # Initialize result dictionary
+        result = {}
+
+        # Extract columns and source codes for each table
+        for table_name, aliases in tables_and_aliases.items():
+            # Skip if table is a CTE or contains a CTE name
+            if table_name in ctes:
+                logging.debug(f"Skipping CTE table: {table_name}")
+                continue
+
+            # Skip if table is an alias of another table
+            is_alias = any(table_name in alias_list for _, alias_list in tables_and_aliases.items() if _ != table_name)
+            if is_alias:
+                logging.debug(f"Skipping alias table: {table_name}")
+                continue
+
+            # Skip if table name is an alias of a CTE
+            is_cte_alias = False
+            for cte in ctes:
+                if any(table_name == alias for alias in tables_and_aliases.get(cte, [])):
+                    is_cte_alias = True
+                    logging.debug(f"Skipping CTE alias: {table_name}")
+                    break
+            if is_cte_alias:
+                continue
+
+            # Extract columns and source codes
+            columns = self._extract_columns(sql_str, table_name, aliases)
+            source_codes = self._extract_source_codes(sql_str, table_name, aliases)
+
+            # Add to result if we found any metadata
+            if columns or source_codes:
+                result[table_name] = {
+                    'columns': columns,
+                    'source_codes': source_codes
+                }
+
+        return result
+
+    def _extract_ctes(self, sql: str) -> List[str]:
+        """Extract CTE names from a SQL query.
+
+        Args:
+            sql (str): The SQL query to extract CTEs from.
+
+        Returns:
+            List[str]: A list of CTE names found in the query.
+        """
+        logger.info("Starting CTE extraction")
+        ctes = []
+        cte_hierarchy = {}  # Track parent-child relationships
+        
+        # First, find the main WITH clause
+        with_match = re.search(r'(?i)WITH\s+(?:RECURSIVE\s+)?(.+?)(?=\s+SELECT\s+(?!.*\bAS\s*\())', sql, re.DOTALL)
+        if not with_match:
+            logger.info("No CTEs found in query")
+            return []
+        
+        cte_block = with_match.group(1)
+        logger.info(f"Found CTE block: {cte_block[:100]}...")  # Log first 100 chars for debugging
+        
+        # Split the CTE block into individual CTEs while respecting nested parentheses
+        def split_ctes(cte_block: str) -> List[str]:
+            result = []
+            current = []
+            paren_count = 0
+            in_cte = False
+            in_subquery = False
+            
+            for char in cte_block:
+                # Track parentheses for subqueries
+                if char == '(':
+                    paren_count += 1
+                    if not in_cte and not in_subquery:
+                        in_subquery = True
+                elif char == ')':
+                    paren_count -= 1
+                    if paren_count == 0:
+                        in_subquery = False
+                
+                # Only split at commas when we're at the top level and in a CTE
+                if char == ',' and paren_count == 0 and in_cte:
+                    if current:
+                        result.append(''.join(current).strip())
+                        current = []
+                    in_cte = False
+                    continue
+                
+                # Check for AS keyword to mark start of CTE definition
+                if len(current) >= 2 and ''.join(current[-2:]).upper() == 'AS':
+                    in_cte = True
+                    in_subquery = False
+                
+                current.append(char)
+            
+            if current and in_cte:
+                result.append(''.join(current).strip())
+            
+            return result
+        
+        cte_definitions = split_ctes(cte_block)
+        logger.info(f"Found {len(cte_definitions)} CTE definitions")
+        
+        # Extract CTE names and build hierarchy
+        for cte_def in cte_definitions:
+            # Match CTE name before AS, handling various whitespace patterns
+            cte_match = re.match(r'^\s*([^\s,(]+)\s+AS\s*\(', cte_def)
+            if cte_match:
+                cte_name = cte_match.group(1)
+                ctes.append(cte_name)
+                logger.info(f"Found CTE: {cte_name}")
+                
+                # Check for nested CTEs
+                nested_with = re.search(r'(?i)WITH\s+(?:RECURSIVE\s+)?(.+?)(?=\s+SELECT\s+(?!.*\bAS\s*\())', cte_def)
+                if nested_with:
+                    nested_ctes = self._extract_ctes(cte_def)
+                    if nested_ctes:
+                        cte_hierarchy[cte_name] = nested_ctes
+                        ctes.extend(nested_ctes)
+                        logger.info(f"Found nested CTEs under {cte_name}: {nested_ctes}")
+        
+        # Also find any references to CTEs in FROM/JOIN clauses
+        main_query = sql[with_match.end():]
+        cte_refs = {}  # Map CTEs to their aliases
+        for cte in ctes:
+            # Look for CTE references in FROM/JOIN clauses
+            cte_ref_matches = re.finditer(rf'\b{re.escape(cte)}\s+(?:AS\s+)?([^\s,)]+)', main_query)
+            aliases = set()
+            for ref in cte_ref_matches:
+                alias = ref.group(1)
+                aliases.add(alias)
+                logger.info(f"Found CTE reference: {cte} AS {alias}")
+            if aliases:
+                cte_refs[cte] = list(aliases)
+        
+        # Remove duplicates while preserving order
+        ctes = list(dict.fromkeys(ctes))
+        logger.info(f"Completed CTE extraction. Found CTEs: {ctes}")
+        logger.info(f"CTE hierarchy: {cte_hierarchy}")
+        logger.info(f"CTE references: {cte_refs}")
+        return ctes
+
+    def _extract_tables_and_aliases(self, sql: str) -> Dict[str, List[str]]:
+        """Extract table names and their aliases from SQL query.
+        
+        Args:
+            sql: SQL query string to parse
+            
+        Returns:
+            Dictionary mapping table aliases to their actual table names
+        """
         parser = Parser(sql)
-        tables = []
+        tables = {}
 
         # First, extract all CTEs to ensure we can properly exclude them
         self._extract_ctes(sql)
@@ -104,11 +199,14 @@ class SQLMetadataExtractor:
                 table_alias in self.cte_names or 
                 any(cte in table_name for cte in self.cte_names) or
                 any(cte in table_alias for cte in self.cte_names)):
+                # Map CTE aliases to their CTE names
+                if table_name in self.cte_names:
+                    self.alias_map[table_alias] = table_name
                 continue
 
             # Add the actual table name to our list if it's not already there
-            if table_name not in tables:
-                tables.append(table_name)
+            if table_name not in tables and table_name not in self.cte_names:
+                tables[table_name] = [table_name]
                 # Map the alias to the actual table name
                 self.alias_map[table_alias] = table_name
 
@@ -129,22 +227,29 @@ class SQLMetadataExtractor:
                 clean_table in tables or
                 any(cte in clean_table for cte in self.cte_names) or
                 any(cte in clean_alias for cte in self.cte_names)):
+                # Map CTE aliases to their CTE names
+                if clean_table in self.cte_names:
+                    self.alias_map[clean_alias] = clean_table
                 continue
                 
-            tables.append(clean_table)
-            self.alias_map[clean_alias] = clean_table
+            if clean_table not in self.cte_names:
+                tables[clean_table] = [clean_alias]
+                self.alias_map[clean_alias] = clean_table
 
-        # Filter out any remaining CTEs from the tables list
-        filtered_tables = []
-        for table in tables:
+        # Filter out any remaining CTEs and their aliases from the tables list
+        filtered_tables = {}
+        for table, alias_list in tables.items():
             if (table not in self.cte_names and 
-                not any(cte in table for cte in self.cte_names)):
-                filtered_tables.append(table)
+                not any(cte in table for cte in self.cte_names) and
+                not any(table in cte for cte in self.cte_names) and
+                not any(table == alias for alias in self.alias_map.keys() if self.alias_map[alias] in self.cte_names)):
+                filtered_tables[table] = alias_list
         
         return filtered_tables
 
-    def _extract_columns(self, sql: str, result: Dict[str, List[Set]]):
+    def _extract_columns(self, sql: str, table_name: str, alias_list: List[str]) -> Set[str]:
         """Extract columns for each table."""
+        columns = set()
         # Pattern to match table.column references in various contexts
         column_pattern = r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*(\w+)\.(\w+)'
         matches = re.finditer(column_pattern, sql)
@@ -161,12 +266,14 @@ class SQLMetadataExtractor:
             actual_table = self.alias_map.get(table_ref, table_ref)
 
             # Only process if it's an actual table and exists in our result
-            if actual_table in result:
-                result[actual_table][0].add(column)
+            if actual_table in alias_list:
+                columns.add(column)
 
-    def _extract_source_codes(self, sql: str, tables: List[str]) -> Dict[str, Set]:
+        return columns
+
+    def _extract_source_codes(self, sql: str, table_name: str, alias_list: List[str]) -> Set[str]:
         """Extract source codes from specific columns."""
-        source_codes = {table: set() for table in tables if table not in self.cte_names}
+        source_codes = set()
 
         for col in self.source_code_columns:
             # Handle IN clauses
@@ -177,13 +284,13 @@ class SQLMetadataExtractor:
                 values_str = match.group(2)
                 actual_table = self.alias_map.get(table_ref, table_ref)
 
-                if actual_table in source_codes:
+                if actual_table in alias_list:
                     # Skip if the IN clause contains a SELECT (subquery)
                     if 'SELECT' in values_str.upper():
                         continue
-                    # Extract values from IN clause
-                    values = {v.strip(" '") for v in values_str.split(',') if v.strip()}
-                    source_codes[actual_table].update(values)
+                    # Extract values from IN clause, handling newlines and spaces
+                    values = [v.strip(" '\n\t") for v in values_str.split(',') if v.strip()]
+                    source_codes.update(values)
 
             # Handle = operator
             equals_pattern = fr'(?i)(\w+)\.{col}\s*=\s*\'([^\']+)\''
@@ -193,20 +300,20 @@ class SQLMetadataExtractor:
                 value = match.group(2)
                 actual_table = self.alias_map.get(table_ref, table_ref)
 
-                if actual_table in source_codes:
-                    source_codes[actual_table].add(value)
+                if actual_table in alias_list:
+                    source_codes.add(value.strip())
 
         return source_codes
 
-    def _update_master_dict(self, current_metadata: Dict[str, List[Set]]):
+    def _update_master_dict(self, current_metadata: Dict[str, Dict[str, List[str]]]):
         """Update master dictionary with new metadata."""
         for table, metadata in current_metadata.items():
             if table not in self.master_dict:
-                self.master_dict[table] = [set(), set()]
-            self.master_dict[table][0].update(metadata[0])  # Update columns
-            self.master_dict[table][1].update(metadata[1])  # Update source codes
+                self.master_dict[table] = {'columns': set(), 'source_codes': set()}
+            self.master_dict[table]['columns'].update(metadata['columns'])
+            self.master_dict[table]['source_codes'].update(metadata['source_codes'])
 
-    def process_dataframe(self, df: pd.DataFrame) -> Dict[str, List[Set]]:
+    def process_dataframe(self, df: pd.DataFrame) -> Dict[str, Dict[str, List[str]]]:
         """Process all queries from a DataFrame."""
         if 'query_text' not in df.columns:
             raise ValueError("DataFrame must contain 'query_text' column")
@@ -344,6 +451,82 @@ def test_queries():
                 SELECT c1.*
                 FROM cte1 c1
             """
+        },
+        {
+            "name": "Mega CTE Test with Complex Spacing",
+            "sql": """
+WITH cte1 AS (
+    SELECT t1.col1, t1.data_srce_cde
+    FROM table1 t1
+    WHERE t1.data_srce_cde IN ('A1', 'B2')
+),
+	cte2 AS (
+		SELECT t2.col1, t2.ar_srce_cde
+		FROM table2 t2
+		WHERE t2.ar_srce_cde = 'X1'
+	)
+,
+cte3 AS (SELECT t3.col1, t3.data_srce_cde
+FROM table3 t3
+WHERE t3.data_srce_cde = 'C3'
+)
+,
+	cte4
+	AS
+	(
+		SELECT t4.col1, t4.ar_srce_cde
+		FROM table4 t4
+		WHERE t4.ar_srce_cde = 'Y2'
+	)
+,
+cte5 AS (
+    WITH nested_cte AS (
+        SELECT t5.col1, t5.data_srce_cde
+        FROM table5 t5
+        WHERE t5.data_srce_cde = 'D4'
+    )
+    SELECT n.*
+    FROM nested_cte n
+)
+,
+cte6 AS (
+    SELECT t6.col1, t6.ar_srce_cde
+    FROM table6 t6
+    WHERE t6.ar_srce_cde IN (
+        'E5',
+        'F6'
+    )
+)
+,
+cte7 AS (
+    SELECT t7.col1, t7.data_srce_cde
+    FROM table7 t7
+    WHERE t7.data_srce_cde = 'G7'
+)
+,
+cte8 AS (
+    SELECT t8.col1, t8.ar_srce_cde
+    FROM table8 t8
+    WHERE t8.ar_srce_cde = 'H8'
+)
+SELECT 
+    c1.*,
+    c2.*,
+    c3.*,
+    c4.*,
+    c5.*,
+    c6.*,
+    c7.*,
+    c8.*
+FROM cte1 c1
+JOIN cte2 c2 ON c1.col1 = c2.col1
+JOIN cte3 c3 ON c2.col1 = c3.col1
+JOIN cte4 c4 ON c3.col1 = c4.col1
+JOIN cte5 c5 ON c4.col1 = c5.col1
+JOIN cte6 c6 ON c5.col1 = c6.col1
+JOIN cte7 c7 ON c6.col1 = c7.col1
+JOIN cte8 c8 ON c7.col1 = c8.col1
+            """
         }
     ]
     
@@ -356,8 +539,8 @@ def test_queries():
             print("\nExtracted Metadata:")
             for table, metadata in result.items():
                 print(f"\nTable: {table}")
-                print(f"Columns: {sorted(list(metadata[0]))}")
-                print(f"Source Codes: {sorted(list(metadata[1]))}")
+                print(f"Columns: {sorted(list(metadata['columns']))}")
+                print(f"Source Codes: {sorted(list(metadata['source_codes']))}")
         except Exception as e:
             print(f"Error processing test case: {str(e)}")
             continue
