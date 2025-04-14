@@ -17,34 +17,75 @@ class SQLMetadataExtractor:
         self.reverse_alias_map = {}  # Track reverse mapping of aliases to tables
         self.cte_names = set()  # Track CTE names to exclude them
 
-    def _extract_sql_metadata(self, sql: str) -> Dict[str, List[Set[str]]]:
-        """Extract metadata from SQL query including tables, columns, and source codes."""
-        # Reset maps for new query
-        self.alias_map = {}
-        self.column_map = {}
-        self.reverse_alias_map = {}
+    def _extract_sql_metadata(self, sql: str) -> Dict[str, List[Set]]:
+        """Extract table names, columns, and source codes from SQL query."""
+        print("\n=== Starting SQL metadata extraction ===")
+        if not isinstance(sql, str):
+            raise ValueError("Input must be a string")
         
-        # Extract all table references first
-        tables = self._extract_table_references(sql)
-        print(f"\nExtracted tables: {tables}")
+        sql = sql.strip()
+        if not sql.endswith(';'):
+            sql = sql + ';'
         
-        # Initialize result dictionary with empty sets for columns and source codes
-        result = {table: [set(), set()] for table in tables}
-        
-        # Process columns
-        self._process_columns(sql, result)
-        
-        # Extract source codes for each table
-        table_source_codes = self._extract_table_source_codes(sql, tables)
-        
-        # Update the source codes in the result dictionary
-        for table, source_codes in table_source_codes.items():
-            if table in result and table not in self.cte_names:  # Only update actual tables
-                result[table][1] = source_codes  # Update source codes set
-                print(f"\nUpdated {table} source codes to: {source_codes}")
-        
-        # Return only non-CTE tables
-        return {t: metadata for t, metadata in result.items() if t not in self.cte_names}
+        try:
+            parser = Parser(sql)
+            result = {}
+            self.alias_map = {}  # Reset maps for new query
+            self.column_map = {}
+            self.reverse_alias_map = {}
+            
+            # Get all tables and initialize result dictionary
+            tables = parser.tables
+            print(f"\nTables found in query: {tables}")
+            if not tables:
+                logger.warning("No tables found in query")
+                return {}
+            
+            # Initialize tables with case-insensitive handling
+            for table in tables:
+                clean_table = table.split('.')[-1].strip('`"[] ').lower()
+                result[clean_table] = [set(), set()]  # [columns, source_codes]
+                self.column_map[clean_table] = set()
+                print(f"Initialized result for table: {clean_table}")
+            
+            # Extract table aliases first
+            self._extract_table_references(sql)
+            print(f"\nAlias map after extraction: {self.alias_map}")
+            
+            # Process columns with strict table association
+            self._process_columns(parser.columns, result)
+            print("\nColumns after processing:")
+            for table, (cols, _) in result.items():
+                print(f"Table {table} columns: {sorted(list(cols))}")
+            
+            # Extract and associate source codes per table
+            table_source_codes = self._extract_table_source_codes(sql, tables)
+            print("\nSource codes after extraction:")
+            for table, codes in table_source_codes.items():
+                print(f"Table {table} source codes: {sorted(list(codes))}")
+            
+            # Add source codes only to their respective tables
+            for table, codes in table_source_codes.items():
+                clean_table = table.split('.')[-1].strip('`"[] ').lower()
+                if clean_table in result:
+                    # Ensure we're not losing any values during the update
+                    print(f"\nUpdating source codes for table {clean_table}")
+                    print(f"Current codes in result: {sorted(list(result[clean_table][1]))}")
+                    print(f"New codes to add: {sorted(list(codes))}")
+                    # Update the source codes set instead of replacing it
+                    result[clean_table][1].update(codes)
+                    print(f"Updated codes in result: {sorted(list(result[clean_table][1]))}")
+            
+            print("\nFinal result dictionary:")
+            for table, (cols, codes) in result.items():
+                print(f"Table: {table}")
+                print(f"Columns: {sorted(list(cols))}")
+                print(f"Source codes: {sorted(list(codes))}")
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error processing query: {str(e)}")
+            return {}
 
     def _extract_table_references(self, sql: str) -> List[str]:
         """Extract table references and aliases from SQL query."""
@@ -96,31 +137,34 @@ class SQLMetadataExtractor:
         
         return list(tables)
 
-    def _process_columns(self, sql: str, result: Dict[str, List[Set[str]]]):
+    def _process_columns(self, columns: List[str], result: Dict[str, List[Set]]):
         """Process columns with strict table association."""
         processed_columns = set()  # Track processed columns to avoid duplicates
         
-        # Extract columns using regex
-        column_pattern = r'(?i)(\w+)\.(\w+)'
-        matches = re.finditer(column_pattern, sql)
-        
-        for match in matches:
-            table_ref, column = match.groups()
-            table_ref = table_ref.lower()
-            column = column.upper()
-            
-            if column == '*' or 'NULL' in column:
+        for column in columns:
+            if '.' not in column:
                 continue
                 
-            # Get actual table name from alias
-            actual_table = self.alias_map.get(table_ref, table_ref)
-            
-            # Only process if it's an actual table (not a CTE) and exists in our result
-            if actual_table in result:
-                result[actual_table][0].add(column)
-                processed_columns.add(column)
+            try:
+                table_ref, column_name = column.split('.')
+                table_ref = table_ref.lower()
+                column_name = column_name.upper()
+                
+                if column_name == '*' or 'NULL' in column_name:
+                    continue
+                    
+                # Get actual table name from alias
+                actual_table = self.alias_map.get(table_ref, table_ref)
+                
+                # Only process if it's an actual table and exists in our result
+                if actual_table in result:
+                    result[actual_table][0].add(column_name)
+                    processed_columns.add(column_name)
+            except ValueError:
+                # Skip columns that don't follow table.column format
+                continue
 
-    def _extract_table_source_codes(self, sql: str, tables: List[str]) -> Dict[str, Set[str]]:
+    def _extract_table_source_codes(self, sql: str, tables: List[str]) -> Dict[str, Set]:
         """Extract source codes associated with specific tables, handling all reference patterns."""
         table_source_codes = {}
         
@@ -230,7 +274,7 @@ class SQLMetadataExtractor:
         # Return only non-CTE tables
         return {t: codes for t, codes in table_source_codes.items() if t not in self.cte_names}
 
-    def _update_master_dict(self, current_metadata: Dict[str, List[Set[str]]]):
+    def _update_master_dict(self, current_metadata: Dict[str, List[Set]]):
         """Update master dictionary with new metadata."""
         for table, metadata in current_metadata.items():
             if table not in self.master_dict:
@@ -239,7 +283,7 @@ class SQLMetadataExtractor:
             self.master_dict[table][0].update(metadata[0])  # Update columns
             self.master_dict[table][1].update(metadata[1])  # Update source codes
 
-    def process_dataframe(self, df: pd.DataFrame) -> Dict[str, List[Set[str]]]:
+    def process_dataframe(self, df: pd.DataFrame) -> Dict[str, List[Set]]:
         """Process all queries from a DataFrame and build a cumulative metadata dictionary."""
         if 'query_text' not in df.columns:
             raise ValueError("DataFrame must contain 'query_text' column")
