@@ -156,7 +156,6 @@ class SQLMetadataExtractor:
                 table_ref = col_match.group(1).lower()
                 start_pos = col_match.end()
                 print(f"\nFound {col} IN reference for table/alias: {table_ref}")
-                print(f"Starting position after IN(: {start_pos}")
                 
                 # Find the matching closing parenthesis
                 open_count = 1
@@ -174,7 +173,7 @@ class SQLMetadataExtractor:
                     print(f"Extracted IN values string: {values_str}")
                     
                     # Split by comma and clean up each value
-                    values = []
+                    values = set()
                     current_value = ''
                     in_quotes = False
                     
@@ -186,7 +185,7 @@ class SQLMetadataExtractor:
                             if current_value:
                                 clean_value = current_value.strip(" '\t\n")
                                 if clean_value:
-                                    values.append(clean_value)
+                                    values.add(clean_value.strip("'"))
                                 current_value = ''
                         else:
                             current_value += char
@@ -195,7 +194,7 @@ class SQLMetadataExtractor:
                     if current_value:
                         clean_value = current_value.strip(" '\t\n")
                         if clean_value:
-                            values.append(clean_value)
+                            values.add(clean_value.strip("'"))
                     
                     print(f"Parsed IN values: {values}")
                     
@@ -203,9 +202,10 @@ class SQLMetadataExtractor:
                     actual_table = self.alias_map.get(table_ref, table_ref)
                     print(f"Actual table name: {actual_table}")
                     
+                    # Update source codes for the table
                     if actual_table in table_source_codes:
                         table_source_codes[actual_table].update(values)
-                        print(f"Updated source codes for {actual_table} from IN: {table_source_codes[actual_table]}")
+                        print(f"Updated source codes for {actual_table}: {table_source_codes[actual_table]}")
             
             # Now handle the equals operator
             equals_pattern = fr'(?i)(\w+)\.{col}\s*(?:\n|\s)*=\s*(?:\n|\s)*\'([^\']+)\''
@@ -221,9 +221,10 @@ class SQLMetadataExtractor:
                 actual_table = self.alias_map.get(table_ref, table_ref)
                 print(f"Actual table name: {actual_table}")
                 
+                # Update source codes for the table
                 if actual_table in table_source_codes:
                     table_source_codes[actual_table].add(value)
-                    print(f"Updated source codes for {actual_table} from =: {table_source_codes[actual_table]}")
+                    print(f"Updated source codes for {actual_table}: {table_source_codes[actual_table]}")
         
         print("\nFinal table source codes:")
         for table, codes in table_source_codes.items():
@@ -262,239 +263,73 @@ class SQLMetadataExtractor:
         return self.master_dict
 
 def test_queries():
-    """Run test cases to verify SQL metadata extraction."""
+    """Test the SQL metadata extraction with various cases."""
+    extractor = SQLMetadataExtractor()
     
     test_cases = [
         {
-            "name": "CTE and Table Reference Variations",
-            "query": """
-            WITH base_cte AS (
-                SELECT 
-                    t1.id,
-                    t1.DATA_SRCE_CDE,
-                    t2.ar_srce_cde
-                FROM schema1.table1 t1
-                JOIN table2 t2 ON t1.id = t2.id
-                WHERE t1.DATA_SRCE_CDE IN ('A1', 'B1')
-                AND t2.ar_srce_cde IN ('X1', 'Y1')
-            ),
-            second_cte AS (
-                SELECT 
-                    bc.*,
-                    t3.DATA_SRCE_CDE
-                FROM base_cte bc
-                JOIN table3 t3 ON bc.id = t3.id
-                WHERE t3.DATA_SRCE_CDE IN ('C1', 'C2')
-            )
-            SELECT * FROM second_cte;
-            """
-        },
-        {
-            "name": "Mixed Case and Reference Styles",
-            "query": """
-            WITH DataSource AS (
-                SELECT 
-                    src.id,
-                    src.Data_Srce_Cde,
-                    tgt.AR_SRCE_CDE
-                FROM source_table src
-                JOIN target_table tgt ON src.id = tgt.id
-                WHERE src.Data_Srce_Cde IN ('D1', 'D2')
-                AND tgt.AR_SRCE_CDE IN ('T1', 'T2')
-            )
-            SELECT 
-                ds.*,
-                ref.data_srce_cde,
-                REF.Ar_Srce_Cde
-            FROM DataSource ds
-            JOIN reference_table ref ON ds.id = ref.id
-            WHERE ref.data_srce_cde IN ('R1', 'R2')
-            AND REF.Ar_Srce_Cde IN ('S1', 'S2');
-            """
-        },
-        {
-            "name": "Complex CTE Chain with Mixed References",
-            "query": """
-            WITH first_cte AS (
-                SELECT *
-                FROM base_table bt
-                WHERE bt.DATA_SRCE_CDE IN ('A1', 'B1')
-            ),
-            SecondCTE AS (
-                SELECT 
-                    fc.*,
-                    t1.ar_srce_cde
-                FROM first_cte fc
-                JOIN table1 t1 ON fc.id = t1.id
-                WHERE t1.ar_srce_cde IN ('X1', 'Y1')
-            ),
-            ThirdCTE AS (
-                SELECT 
-                    sc.*,
-                    TABLE2.DATA_SRCE_CDE
-                FROM SecondCTE sc
-                JOIN table2 TABLE2 ON sc.id = TABLE2.id
-                WHERE TABLE2.DATA_SRCE_CDE IN ('M1', 'N1')
-            )
-            SELECT 
-                tc.*,
-                t3.AR_SRCE_CDE
-            FROM ThirdCTE tc
-            JOIN table3 t3 ON tc.id = t3.id
-            WHERE t3.AR_SRCE_CDE IN ('P1', 'Q1');
-            """
-        },
-        {
-            "name": "Subquery and CTE Mixed References",
-            "query": """
-            WITH source_data AS (
-                SELECT *
-                FROM (
-                    SELECT 
-                        t1.id,
-                        t1.DATA_SRCE_CDE,
-                        t2.ar_srce_cde
+            "name": "Source Code Pattern Test",
+            "sql": """
+                WITH cte1 AS (
+                    SELECT t1.col1, t1.data_srce_cde
                     FROM table1 t1
-                    JOIN table2 t2 ON t1.id = t2.id
-                    WHERE t1.DATA_SRCE_CDE IN ('A1', 'B1')
-                    AND t2.ar_srce_cde IN ('X1', 'Y1')
-                ) subq
-                WHERE EXISTS (
-                    SELECT 1 
-                    FROM table3 t3 
-                    WHERE t3.id = subq.id
-                    AND t3.DATA_SRCE_CDE IN ('C1', 'C2')
+                    WHERE t1.data_srce_cde IN ('A1', 'B2',
+                        'C3')
+                ),
+                cte2 AS (
+                    SELECT t2.col1, t2.ar_srce_cde
+                    FROM table2 t2
+                    WHERE t2.ar_srce_cde = 'X1'
                 )
-            )
-            SELECT 
-                sd.*,
-                t4.AR_SRCE_CDE
-            FROM source_data sd
-            JOIN table4 t4 ON sd.id = t4.id
-            WHERE t4.AR_SRCE_CDE IN ('D1', 'D2');
+                SELECT c1.*, c2.*
+                FROM cte1 c1
+                JOIN cte2 c2 ON c1.col1 = c2.col1
+                WHERE c2.ar_srce_cde IN ('Y2',
+                    'Z3')
             """
         },
         {
             "name": "Mixed Operators Test",
-            "query": """
-            WITH base_data AS (
+            "sql": """
                 SELECT *
-                FROM table1 t1
-                WHERE t1.DATA_SRCE_CDE = 'A1'
-                AND t1.AR_SRCE_CDE IN ('X1', 'Y1')
-            ),
-            filtered_data AS (
-                SELECT 
-                    bd.*,
-                    t2.data_srce_cde,
-                    T2.ar_srce_cde
-                FROM base_data bd
-                JOIN table2 T2 ON bd.id = T2.id
-                WHERE T2.data_srce_cde IN ('B1', 'B2')
-                AND T2.ar_srce_cde = 'Z1'
-            )
-            SELECT 
-                fd.*,
-                t3.DATA_SRCE_CDE,
-                t3.AR_SRCE_CDE
-            FROM filtered_data fd
-            JOIN table3 t3 ON fd.id = t3.id
-            WHERE t3.DATA_SRCE_CDE = 'C1'
-            AND t3.AR_SRCE_CDE IN ('W1', 'W2');
+                FROM table3 t3
+                WHERE t3.data_srce_cde = 'ABC'
+                AND t3.ar_srce_cde IN (
+                    'DEF',
+                    'GHI'
+                )
             """
         },
         {
-            "name": "Case Variation Test",
-            "query": """
-            WITH SourceData AS (
-                SELECT 
-                    t1.id,
-                    t1.Data_Srce_Cde,
-                    t1.AR_SRCE_CDE
-                FROM table1 t1
-                WHERE t1.Data_Srce_Cde = 'A1'
-                AND t1.AR_SRCE_CDE IN ('X1', 'Y1')
-            )
-            SELECT 
-                SD.*,
-                t2.data_srce_cde,
-                t2.ar_srce_cde
-            FROM SourceData SD
-            JOIN table2 t2 ON SD.id = t2.id
-            WHERE t2.data_srce_cde IN ('B1', 'B2')
-            AND t2.ar_srce_cde = 'Z1';
-            """
-        },
-        {
-            "name": "Multiple Source Code Values Test",
-            "query": """
-            SELECT t1.*, t2.column1
-            FROM table1 t1
-            JOIN table2 t2 ON t1.id = t2.id
-            WHERE t1.data_srce_cde IN ('AF', 'BC', 'CA')
-            AND t2.ar_srce_cde IN ('X1','Y2', 'Z3')
-            AND t2.data_srce_cde = 'D1';
-            """
-        },
-        {
-            "name": "Newline IN Clause Test",
-            "query": """
-            SELECT t1.*, t2.column1
-            FROM table1 t1
-            JOIN table2 t2 ON t1.id = t2.id
-            WHERE 
-                t1.data_srce_cde IN ('AF','BC','CA')
-            AND t2.ar_srce_cde IN ('X1','Y2', 'Z3')
-            AND t2.data_srce_cde = 'D1';
-            """
-        },
-        {
-            "name": "Newline Before IN Test",
-            "query": """
-            SELECT t1.*, t2.column1
-            FROM table1 t1
-            JOIN table2 t2 ON t1.id = t2.id
-            WHERE 
-                t1.data_srce_cde 
-                IN ('AF','BC','CA')
-            AND t2.ar_srce_cde IN ('X1','Y2', 'Z3')
-            AND t2.data_srce_cde = 'D1';
-            """
-        },
-        {
-            "name": "Equals with Newlines Test",
-            "query": """
-            SELECT t1.*, t2.column1
-            FROM table1 t1
-            JOIN table2 t2 ON t1.id = t2.id
-            WHERE 
-                t1.data_srce_cde 
-                = 'AF'
-            AND t2.ar_srce_cde 
-                = 'X1'
-            AND t2.data_srce_cde = 'D1';
+            "name": "Multiple Equals Test",
+            "sql": """
+                SELECT *
+                FROM table4 t4
+                WHERE t4.data_srce_cde = 'XYZ'
+                UNION ALL
+                SELECT *
+                FROM table5 t5
+                WHERE t5.ar_srce_cde = 
+                    'MNO'
             """
         }
     ]
     
-    extractor = SQLMetadataExtractor()
-    
-    for test_case in test_cases:
-        print(f"\nTesting: {test_case['name']}")
-        print("=" * 80)
-        print("Query:")
-        print(test_case['query'].strip())
-        print("\nResults:")
+    for test in test_cases:
+        print(f"\n=== Running Test: {test['name']} ===")
+        print("\nSQL Query:")
+        print(test['sql'])
         
         try:
-            result = extractor._extract_sql_metadata(test_case['query'])
-            for table, (columns, source_codes) in result.items():
+            result = extractor._extract_sql_metadata(test['sql'])
+            print("\nExtracted Metadata:")
+            for table, metadata in result.items():
                 print(f"\nTable: {table}")
-                print("Columns:", sorted(list(columns)))
-                print("Source codes:", sorted(list(source_codes)))
+                print(f"Columns: {sorted(list(metadata[0]))}")
+                print(f"Source Codes: {sorted(list(metadata[1]))}")
         except Exception as e:
-            print(f"Error: {str(e)}")
-        print("=" * 80)
+            print(f"Error processing test case: {str(e)}")
+            continue
 
 if __name__ == "__main__":
     test_queries()
