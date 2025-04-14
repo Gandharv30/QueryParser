@@ -53,7 +53,7 @@ class SQLMetadataExtractor:
             print(f"\nAlias map after extraction: {self.alias_map}")
             
             # Process columns with strict table association
-            self._process_columns(parser.columns, result)
+            self._process_columns(parser.columns, result, sql)
             print("\nColumns after processing:")
             for table, (cols, _) in result.items():
                 print(f"Table {table} columns: {sorted(list(cols))}")
@@ -137,7 +137,7 @@ class SQLMetadataExtractor:
         
         return list(tables)
 
-    def _process_columns(self, columns: List[str], result: Dict[str, List[Set]]):
+    def _process_columns(self, columns: List[str], result: Dict[str, List[Set]], sql: str):
         """Process columns with strict table association."""
         processed_columns = set()  # Track processed columns to avoid duplicates
         
@@ -160,9 +160,31 @@ class SQLMetadataExtractor:
                 if actual_table in result:
                     result[actual_table][0].add(column_name)
                     processed_columns.add(column_name)
+                    print(f"Added column {column_name} to table {actual_table}")
             except ValueError:
                 # Skip columns that don't follow table.column format
                 continue
+        
+        # Also process columns from the original SQL query to catch any missed columns
+        column_pattern = r'(?i)(\w+)\.(\w+)'
+        matches = re.finditer(column_pattern, sql)
+        
+        for match in matches:
+            table_ref, column = match.groups()
+            table_ref = table_ref.lower()
+            column = column.upper()
+            
+            if column == '*' or 'NULL' in column:
+                continue
+                
+            # Get actual table name from alias
+            actual_table = self.alias_map.get(table_ref, table_ref)
+            
+            # Only process if it's an actual table and exists in our result
+            if actual_table in result:
+                result[actual_table][0].add(column)
+                processed_columns.add(column)
+                print(f"Added column {column} to table {actual_table} from SQL pattern")
 
     def _extract_table_source_codes(self, sql: str, tables: List[str]) -> Dict[str, Set]:
         """Extract source codes associated with specific tables, handling all reference patterns."""
