@@ -11,12 +11,12 @@ logger = logging.getLogger(__name__)
 class SQLMetadataExtractor:
     def __init__(self):
         self.source_code_columns: List[str] = ['AR_SRCE_CDE', 'DATA_SRCE_CDE']
-        self.master_dict: Dict[str, Dict[str, List[str]]] = {}
+        self.master_dict: Dict[str, Dict[str, Set[str]]] = {}
         self.alias_map: Dict[str, str] = {}
         self.cte_names: Set[str] = set()
         self.table_aliases: Dict[str, str] = {}
 
-    def _extract_sql_metadata(self, sql_str: str) -> Dict[str, Dict[str, List[str]]]:
+    def _extract_sql_metadata(self, sql_str: str) -> Dict[str, Dict[str, Set[str]]]:
         """
         Extract metadata from SQL query including tables, columns, and source codes.
         """
@@ -136,8 +136,8 @@ class SQLMetadataExtractor:
         
         # Extract CTE names and build hierarchy
         for cte_def in cte_definitions:
-            # Match CTE name before AS, handling various whitespace patterns
-            cte_match = re.match(r'^\s*([^\s,(]+)\s+AS\s*\(', cte_def)
+            # Match CTE name before AS, handling various whitespace patterns and column lists
+            cte_match = re.match(r'^\s*([^\s,(]+)(?:\s*\([^)]*\))?\s+AS\s*\(', cte_def)
             if cte_match:
                 cte_name = cte_match.group(1)
                 ctes.append(cte_name)
@@ -250,8 +250,8 @@ class SQLMetadataExtractor:
     def _extract_columns(self, sql: str, table_name: str, alias_list: List[str]) -> Set[str]:
         """Extract columns for each table."""
         columns = set()
-        # Pattern to match table.column references in various contexts
-        column_pattern = r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*(\w+)\.(\w+)'
+        # Pattern to match table.column references in various contexts, excluding subqueries
+        column_pattern = r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*(\w+)\.(\w+)(?![^()]*\bSELECT\b)'
         matches = re.finditer(column_pattern, sql)
 
         for match in matches:
@@ -276,8 +276,8 @@ class SQLMetadataExtractor:
         source_codes = set()
 
         for col in self.source_code_columns:
-            # Handle IN clauses
-            in_pattern = fr'(?i)(\w+)\.{col}\s*IN\s*\(([^)]+)\)'
+            # Handle IN clauses with better subquery detection
+            in_pattern = fr'(?i)(\w+)\.{col}\s*IN\s*\(([^)]+)\)(?![^()]*\bSELECT\b)'
             in_matches = re.finditer(in_pattern, sql)
             for match in in_matches:
                 table_ref = match.group(1).lower()
@@ -288,12 +288,33 @@ class SQLMetadataExtractor:
                     # Skip if the IN clause contains a SELECT (subquery)
                     if 'SELECT' in values_str.upper():
                         continue
-                    # Extract values from IN clause, handling newlines and spaces
-                    values = [v.strip(" '\n\t") for v in values_str.split(',') if v.strip()]
+                    # Extract values from IN clause, handling newlines, spaces, and nested parentheses
+                    values = []
+                    current_value = []
+                    paren_count = 0
+                    for char in values_str:
+                        if char == '(':
+                            paren_count += 1
+                        elif char == ')':
+                            paren_count -= 1
+                        elif char == ',' and paren_count == 0:
+                            if current_value:
+                                value = ''.join(current_value).strip(" '\n\t")
+                                if value:
+                                    values.append(value)
+                                current_value = []
+                            continue
+                        current_value.append(char)
+                    
+                    if current_value:
+                        value = ''.join(current_value).strip(" '\n\t")
+                        if value:
+                            values.append(value)
+                    
                     source_codes.update(values)
 
-            # Handle = operator
-            equals_pattern = fr'(?i)(\w+)\.{col}\s*=\s*\'([^\']+)\''
+            # Handle = operator with better value extraction
+            equals_pattern = fr'(?i)(\w+)\.{col}\s*=\s*\'([^\']+)\'(?![^()]*\bSELECT\b)'
             equals_matches = re.finditer(equals_pattern, sql)
             for match in equals_matches:
                 table_ref = match.group(1).lower()
@@ -305,15 +326,20 @@ class SQLMetadataExtractor:
 
         return source_codes
 
-    def _update_master_dict(self, current_metadata: Dict[str, Dict[str, List[str]]]):
+    def _update_master_dict(self, current_metadata: Dict[str, Dict[str, Set[str]]]):
         """Update master dictionary with new metadata."""
         for table, metadata in current_metadata.items():
             if table not in self.master_dict:
                 self.master_dict[table] = {'columns': set(), 'source_codes': set()}
-            self.master_dict[table]['columns'].update(metadata['columns'])
-            self.master_dict[table]['source_codes'].update(metadata['source_codes'])
+            
+            # Convert lists to sets if necessary
+            columns = set(metadata['columns']) if isinstance(metadata['columns'], list) else metadata['columns']
+            source_codes = set(metadata['source_codes']) if isinstance(metadata['source_codes'], list) else metadata['source_codes']
+            
+            self.master_dict[table]['columns'].update(columns)
+            self.master_dict[table]['source_codes'].update(source_codes)
 
-    def process_dataframe(self, df: pd.DataFrame) -> Dict[str, Dict[str, List[str]]]:
+    def process_dataframe(self, df: pd.DataFrame) -> Dict[str, Dict[str, Set[str]]]:
         """Process all queries from a DataFrame."""
         if 'query_text' not in df.columns:
             raise ValueError("DataFrame must contain 'query_text' column")
