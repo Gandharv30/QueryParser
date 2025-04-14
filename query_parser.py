@@ -20,39 +20,44 @@ class SQLMetadataExtractor:
         """
         Extract metadata from SQL query including tables, columns, and source codes.
         """
+        print("\n=== Starting SQL Metadata Extraction ===")
+        logger.info("Starting SQL metadata extraction")
         if not sql_str or not isinstance(sql_str, str):
+            logger.warning("Empty or invalid SQL string provided")
             return {}
 
         # Extract CTEs first to exclude them from results
-        ctes = self._extract_ctes(sql_str)
-        logging.debug(f"Found CTEs: {ctes}")
+        self.cte_names = set(self._extract_ctes(sql_str))
+        print(f"\nFound CTEs: {self.cte_names}")
 
         # Extract tables and their aliases
         tables_and_aliases = self._extract_tables_and_aliases(sql_str)
-        logging.debug(f"Found tables and aliases: {tables_and_aliases}")
+        print(f"\nFound tables and aliases: {tables_and_aliases}")
 
         # Initialize result dictionary
         result = {}
 
         # Extract columns and source codes for each table
         for table_name, aliases in tables_and_aliases.items():
+            print(f"\nProcessing table: {table_name} with aliases: {aliases}")
+            
             # Skip if table is a CTE or contains a CTE name
-            if table_name in ctes:
-                logging.debug(f"Skipping CTE table: {table_name}")
+            if table_name in self.cte_names:
+                print(f"Skipping CTE table: {table_name}")
                 continue
 
             # Skip if table is an alias of another table
             is_alias = any(table_name in alias_list for _, alias_list in tables_and_aliases.items() if _ != table_name)
             if is_alias:
-                logging.debug(f"Skipping alias table: {table_name}")
+                print(f"Skipping alias table: {table_name}")
                 continue
 
             # Skip if table name is an alias of a CTE
             is_cte_alias = False
-            for cte in ctes:
+            for cte in self.cte_names:
                 if any(table_name == alias for alias in tables_and_aliases.get(cte, [])):
                     is_cte_alias = True
-                    logging.debug(f"Skipping CTE alias: {table_name}")
+                    print(f"Skipping CTE alias: {table_name}")
                     break
             if is_cte_alias:
                 continue
@@ -60,6 +65,8 @@ class SQLMetadataExtractor:
             # Extract columns and source codes
             columns = self._extract_columns(sql_str, table_name, aliases)
             source_codes = self._extract_source_codes(sql_str, table_name, aliases)
+            print(f"Found columns for {table_name}: {columns}")
+            print(f"Found source codes for {table_name}: {source_codes}")
 
             # Add to result if we found any metadata
             if columns or source_codes:
@@ -67,7 +74,9 @@ class SQLMetadataExtractor:
                     'columns': columns,
                     'source_codes': source_codes
                 }
+                print(f"Added metadata for table {table_name} to result")
 
+        print(f"\nFinal result dictionary: {result}")
         return result
 
     def _extract_ctes(self, sql: str) -> List[str]:
@@ -174,43 +183,14 @@ class SQLMetadataExtractor:
         return ctes
 
     def _extract_tables_and_aliases(self, sql: str) -> Dict[str, List[str]]:
-        """Extract table names and their aliases from SQL query.
-        
-        Args:
-            sql: SQL query string to parse
-            
-        Returns:
-            Dictionary mapping table aliases to their actual table names
-        """
-        parser = Parser(sql)
+        """Extract table names and their aliases from SQL query."""
+        logger.info("Starting table and alias extraction")
         tables = {}
 
         # First, extract all CTEs to ensure we can properly exclude them
         self._extract_ctes(sql)
 
-        # Process each table and its alias
-        for table, alias in parser.tables_aliases.items():
-            # Get the actual table name (before the alias)
-            table_name = table.split('.')[-1].strip('`"[] ').lower()
-            table_alias = alias.split('.')[-1].strip('`"[] ').lower()
-            
-            # Skip if this is a CTE or a reference to a CTE
-            if (table_name in self.cte_names or 
-                table_alias in self.cte_names or 
-                any(cte in table_name for cte in self.cte_names) or
-                any(cte in table_alias for cte in self.cte_names)):
-                # Map CTE aliases to their CTE names
-                if table_name in self.cte_names:
-                    self.alias_map[table_alias] = table_name
-                continue
-
-            # Add the actual table name to our list if it's not already there
-            if table_name not in tables and table_name not in self.cte_names:
-                tables[table_name] = [table_name]
-                # Map the alias to the actual table name
-                self.alias_map[table_alias] = table_name
-
-        # Also extract tables from FROM and JOIN clauses to catch any missed tables
+        # Pattern to match table references in FROM and JOIN clauses
         table_pattern = r'(?i)(?:FROM|JOIN)\s+([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?'
         matches = re.finditer(table_pattern, sql)
         
@@ -218,23 +198,28 @@ class SQLMetadataExtractor:
             table = match.group(1)
             alias = match.group(2) if match.group(2) else table
             
+            # Clean up table and alias names
             clean_table = table.split('.')[-1].strip('`"[] ').lower()
             clean_alias = alias.split('.')[-1].strip('`"[] ').lower()
+            logger.info(f"Found table in FROM/JOIN: {clean_table} with alias: {clean_alias}")
             
-            # Skip if this is a CTE or a reference to a CTE or already processed
+            # Skip if this is a CTE or a reference to a CTE
             if (clean_table in self.cte_names or 
                 clean_alias in self.cte_names or 
-                clean_table in tables or
                 any(cte in clean_table for cte in self.cte_names) or
                 any(cte in clean_alias for cte in self.cte_names)):
+                logger.info(f"Skipping CTE or CTE reference: {clean_table} ({clean_alias})")
                 # Map CTE aliases to their CTE names
                 if clean_table in self.cte_names:
                     self.alias_map[clean_alias] = clean_table
                 continue
                 
-            if clean_table not in self.cte_names:
+            # Add the table to our list if it's not already there
+            if clean_table not in tables:
                 tables[clean_table] = [clean_alias]
+                # Map the alias to the actual table name
                 self.alias_map[clean_alias] = clean_table
+                logger.info(f"Added table: {clean_table} with alias: {clean_alias}")
 
         # Filter out any remaining CTEs and their aliases from the tables list
         filtered_tables = {}
@@ -244,31 +229,42 @@ class SQLMetadataExtractor:
                 not any(table in cte for cte in self.cte_names) and
                 not any(table == alias for alias in self.alias_map.keys() if self.alias_map[alias] in self.cte_names)):
                 filtered_tables[table] = alias_list
+                logger.info(f"Kept table after filtering: {table} with aliases: {alias_list}")
+            else:
+                logger.info(f"Filtered out table: {table}")
         
+        logger.info(f"Completed table and alias extraction. Found tables: {filtered_tables}")
         return filtered_tables
 
     def _extract_columns(self, sql: str, table_name: str, alias_list: List[str]) -> Set[str]:
         """Extract columns for each table."""
+        print(f"\nExtracting columns for table: {table_name}")
+        print(f"Using aliases: {alias_list}")
         columns = set()
-        # Pattern to match table.column references in various contexts, excluding subqueries
-        column_pattern = r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*(\w+)\.(\w+)(?![^()]*\bSELECT\b)'
+        # Pattern to match table.column references in various contexts
+        column_pattern = r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)(?=\s*(?:,|\)|$|\s|AND|OR|IN|>|<|=|!=|>=|<=))'
         matches = re.finditer(column_pattern, sql)
 
         for match in matches:
             table_ref, column = match.groups()
             table_ref = table_ref.lower()
             column = column.upper()
+            print(f"Found potential column reference: {table_ref}.{column}")
 
             if column == '*' or 'NULL' in column:
+                print(f"Skipping wildcard or NULL column: {column}")
                 continue
 
             # Get actual table name from alias
             actual_table = self.alias_map.get(table_ref, table_ref)
+            print(f"Resolved table reference: {table_ref} -> {actual_table}")
 
             # Only process if it's an actual table and exists in our result
             if actual_table in alias_list:
                 columns.add(column)
+                print(f"Added column {column} for table {actual_table}")
 
+        print(f"Final columns for {table_name}: {columns}")
         return columns
 
     def _extract_source_codes(self, sql: str, table_name: str, alias_list: List[str]) -> Set[str]:
