@@ -18,6 +18,7 @@ class SQLMetadataExtractor:
 
     def _extract_sql_metadata(self, sql: str) -> Dict[str, List[Set]]:
         """Extract table names, columns, and source codes from SQL query."""
+        print("\n=== Starting SQL metadata extraction ===")
         if not isinstance(sql, str):
             raise ValueError("Input must be a string")
         
@@ -34,6 +35,7 @@ class SQLMetadataExtractor:
             
             # Get all tables and initialize result dictionary
             tables = parser.tables
+            print(f"\nTables found in query: {tables}")
             if not tables:
                 logger.warning("No tables found in query")
                 return {}
@@ -43,21 +45,36 @@ class SQLMetadataExtractor:
                 clean_table = table.split('.')[-1].strip('`"[] ').lower()
                 result[clean_table] = [set(), set()]  # [columns, source_codes]
                 self.column_map[clean_table] = set()
+                print(f"Initialized result for table: {clean_table}")
             
             # Extract table aliases first
             self._extract_table_references(sql)
+            print(f"\nAlias map after extraction: {self.alias_map}")
             
             # Process columns with strict table association
             self._process_columns(parser.columns, result)
+            print("\nColumns after processing:")
+            for table, (cols, _) in result.items():
+                print(f"Table {table} columns: {sorted(list(cols))}")
             
             # Extract and associate source codes per table
             table_source_codes = self._extract_table_source_codes(sql, tables)
+            print("\nSource codes after extraction:")
+            for table, codes in table_source_codes.items():
+                print(f"Table {table} source codes: {sorted(list(codes))}")
             
             # Add source codes only to their respective tables
             for table, codes in table_source_codes.items():
                 clean_table = table.split('.')[-1].strip('`"[] ').lower()
                 if clean_table in result:
                     result[clean_table][1].update(codes)
+                    print(f"Updated result for table {clean_table} with source codes: {sorted(list(codes))}")
+            
+            print("\nFinal result dictionary:")
+            for table, (cols, codes) in result.items():
+                print(f"Table: {table}")
+                print(f"Columns: {sorted(list(cols))}")
+                print(f"Source codes: {sorted(list(codes))}")
             
             return result
             
@@ -139,13 +156,19 @@ class SQLMetadataExtractor:
         """Extract source codes associated with specific tables, handling all reference patterns."""
         table_source_codes = {}
         
+        print("\n=== Starting source code extraction ===")
+        print(f"Tables found: {tables}")
+        
         # Initialize source codes for all tables
         for table in tables:
             clean_table = table.split('.')[-1].strip('`"[] ').lower()
             table_source_codes[clean_table] = set()
+            print(f"Initialized table: {clean_table}")
         
         # Extract source codes using simplified patterns
         for col in self.source_code_columns:
+            print(f"\nProcessing column: {col}")
+            
             # Pattern for IN clause - captures everything between parentheses
             in_pattern = fr'''(?ix)                 # Case insensitive and verbose mode
                 (?:FROM|JOIN|WHERE|AND|OR|\()\s*   # SQL keywords or opening parenthesis
@@ -164,7 +187,7 @@ class SQLMetadataExtractor:
                 (\w+)                             # Table name or alias
                 \.{col}\s*                        # Column name
                 =\s*                              # Equals operator
-                ([^,;\s)]+)                       # Value after equals (until comma, semicolon, space, or closing parenthesis)
+                ([^,;\s)]+)                       # Value after equals (until comma, semicolin, space, or closing parenthesis)
             '''
             
             # Process IN clause matches
@@ -173,14 +196,23 @@ class SQLMetadataExtractor:
                 schema, table_ref, values_str = match.groups()
                 table_ref = table_ref.lower() if table_ref else ''
                 
+                print(f"\nFound IN clause match for {col}:")
+                print(f"Schema: {schema}, Table ref: {table_ref}")
+                print(f"Values string: {values_str}")
+                
                 # Get actual table name from alias if exists
                 actual_table = self.alias_map.get(table_ref, table_ref)
+                print(f"Actual table: {actual_table}")
                 
                 if actual_table in table_source_codes:
                     # Extract all values between quotes or as standalone words
                     values = re.findall(r"'([^']*)'|([^,\s]+)", values_str)
+                    print(f"Raw values found: {values}")
+                    
                     # Flatten the list of tuples and filter out empty strings
                     values = [v[0] or v[1] for v in values if v[0] or v[1]]
+                    print(f"Flattened values: {values}")
+                    
                     # Clean and validate values before adding
                     cleaned_values = set()
                     for value in values:
@@ -189,8 +221,11 @@ class SQLMetadataExtractor:
                         # Skip empty values and SQL keywords
                         if value and value.upper() not in {'AND', 'OR', 'IN', 'NOT', 'NULL', 'TRUE', 'FALSE'}:
                             cleaned_values.add(value)
+                            print(f"Adding cleaned value: {value}")
+                    
                     # Update source codes for the table
                     table_source_codes[actual_table].update(cleaned_values)
+                    print(f"Updated source codes for {actual_table}: {table_source_codes[actual_table]}")
             
             # Process equals operator matches
             equals_matches = re.finditer(equals_pattern, sql)
@@ -198,14 +233,21 @@ class SQLMetadataExtractor:
                 schema, table_ref, value = match.groups()
                 table_ref = table_ref.lower() if table_ref else ''
                 
+                print(f"\nFound equals match for {col}:")
+                print(f"Schema: {schema}, Table ref: {table_ref}")
+                print(f"Raw value: {value}")
+                
                 # Get actual table name from alias if exists
                 actual_table = self.alias_map.get(table_ref, table_ref)
+                print(f"Actual table: {actual_table}")
                 
                 if actual_table in table_source_codes:
                     # Clean and validate the value
                     value = value.strip().strip("'\"")
                     if value and value.upper() not in {'AND', 'OR', 'IN', 'NOT', 'NULL', 'TRUE', 'FALSE'}:
+                        print(f"Adding cleaned value: {value}")
                         table_source_codes[actual_table].add(value)
+                        print(f"Updated source codes for {actual_table}: {table_source_codes[actual_table]}")
             
             # CTE pattern for IN clause
             cte_in_pattern = fr'''(?ix)            # Case insensitive and verbose mode
@@ -235,11 +277,19 @@ class SQLMetadataExtractor:
                 cte_name = match.group(1).lower()
                 values_str = match.group(2)
                 
+                print(f"\nFound CTE IN clause match for {col}:")
+                print(f"CTE name: {cte_name}")
+                print(f"Values string: {values_str}")
+                
                 if cte_name in table_source_codes:
                     # Extract all values between quotes or as standalone words
                     values = re.findall(r"'([^']*)'|([^,\s]+)", values_str)
+                    print(f"Raw values found: {values}")
+                    
                     # Flatten the list of tuples and filter out empty strings
                     values = [v[0] or v[1] for v in values if v[0] or v[1]]
+                    print(f"Flattened values: {values}")
+                    
                     # Clean and validate values before adding
                     cleaned_values = set()
                     for value in values:
@@ -248,8 +298,11 @@ class SQLMetadataExtractor:
                         # Skip empty values and SQL keywords
                         if value and value.upper() not in {'AND', 'OR', 'IN', 'NOT', 'NULL', 'TRUE', 'FALSE'}:
                             cleaned_values.add(value)
+                            print(f"Adding cleaned value: {value}")
+                    
                     # Update source codes for the table
                     table_source_codes[cte_name].update(cleaned_values)
+                    print(f"Updated source codes for {cte_name}: {table_source_codes[cte_name]}")
             
             # Process CTE equals operator matches
             cte_equals_matches = re.finditer(cte_equals_pattern, sql)
@@ -257,25 +310,52 @@ class SQLMetadataExtractor:
                 cte_name = match.group(1).lower()
                 value = match.group(2)
                 
+                print(f"\nFound CTE equals match for {col}:")
+                print(f"CTE name: {cte_name}")
+                print(f"Raw value: {value}")
+                
                 if cte_name in table_source_codes:
                     # Clean and validate the value
                     value = value.strip().strip("'\"")
                     if value and value.upper() not in {'AND', 'OR', 'IN', 'NOT', 'NULL', 'TRUE', 'FALSE'}:
+                        print(f"Adding cleaned value: {value}")
                         table_source_codes[cte_name].add(value)
+                        print(f"Updated source codes for {cte_name}: {table_source_codes[cte_name]}")
+        
+        print("\n=== Final source codes dictionary ===")
+        for table, codes in table_source_codes.items():
+            print(f"Table: {table}")
+            print(f"Source codes: {sorted(list(codes))}")
         
         return table_source_codes
 
     def _update_master_dict(self, current_metadata: Dict[str, List[Set]]):
         """Update master dictionary with new metadata."""
+        print("\n=== Updating master dictionary ===")
         for table, (columns, source_codes) in current_metadata.items():
+            print(f"\nProcessing table: {table}")
+            print(f"Current columns: {sorted(list(columns))}")
+            print(f"Current source codes: {sorted(list(source_codes))}")
+            
             if table not in self.master_dict:
                 self.master_dict[table] = [set(), set()]
+                print(f"Created new entry for table {table}")
             
             self.master_dict[table][0].update(columns)
             self.master_dict[table][1].update(source_codes)
+            print(f"Updated master dict for {table}:")
+            print(f"Columns: {sorted(list(self.master_dict[table][0]))}")
+            print(f"Source codes: {sorted(list(self.master_dict[table][1]))}")
+        
+        print("\nFinal master dictionary:")
+        for table, (cols, codes) in self.master_dict.items():
+            print(f"Table: {table}")
+            print(f"Columns: {sorted(list(cols))}")
+            print(f"Source codes: {sorted(list(codes))}")
 
     def process_dataframe(self, df: pd.DataFrame) -> Dict[str, List[Set]]:
         """Process all queries from a DataFrame and build a cumulative metadata dictionary."""
+        print("\n=== Starting DataFrame processing ===")
         if 'query_text' not in df.columns:
             raise ValueError("DataFrame must contain 'query_text' column")
         
@@ -285,13 +365,20 @@ class SQLMetadataExtractor:
                 if pd.isna(query) or not query.strip():
                     logger.warning(f"Empty query found at index {index}")
                     continue
-                    
+                
+                print(f"\nProcessing query at index {index}")
                 current_metadata = self._extract_sql_metadata(query)
                 self._update_master_dict(current_metadata)
                 logger.info(f"Successfully processed query at index {index}")
             except Exception as e:
                 logger.error(f"Error processing query at index {index}: {str(e)}")
                 continue
+        
+        print("\n=== Final master dictionary after all queries ===")
+        for table, (cols, codes) in self.master_dict.items():
+            print(f"Table: {table}")
+            print(f"Columns: {sorted(list(cols))}")
+            print(f"Source codes: {sorted(list(codes))}")
         
         return self.master_dict
 
