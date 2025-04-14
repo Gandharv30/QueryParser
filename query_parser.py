@@ -71,6 +71,7 @@ class SQLMetadataExtractor:
                     print(f"\nUpdating source codes for table {clean_table}")
                     print(f"Current codes in result: {sorted(list(result[clean_table][1]))}")
                     print(f"New codes to add: {sorted(list(codes))}")
+                    # Update the source codes set instead of replacing it
                     result[clean_table][1].update(codes)
                     print(f"Updated codes in result: {sorted(list(result[clean_table][1]))}")
             
