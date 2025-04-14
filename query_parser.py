@@ -15,6 +15,7 @@ class SQLMetadataExtractor:
         self.alias_map = {}  # Track table aliases
         self.column_map = {}  # Track which columns belong to which tables
         self.reverse_alias_map = {}  # Track reverse mapping of aliases to tables
+        self.cte_names = set()  # Track CTE names to exclude them
 
     def _extract_sql_metadata(self, sql: str) -> Dict[str, List[Set[str]]]:
         """Extract metadata from SQL query including tables, columns, and source codes."""
@@ -38,15 +39,27 @@ class SQLMetadataExtractor:
         
         # Update the source codes in the result dictionary
         for table, source_codes in table_source_codes.items():
-            if table in result:
+            if table in result and table not in self.cte_names:  # Only update actual tables
                 result[table][1] = source_codes  # Update source codes set
                 print(f"\nUpdated {table} source codes to: {source_codes}")
         
-        return result
+        # Return only non-CTE tables
+        return {t: metadata for t, metadata in result.items() if t not in self.cte_names}
 
     def _extract_table_references(self, sql: str) -> List[str]:
         """Extract table references and aliases from SQL query."""
-        tables = []
+        tables = set()  # Use set to avoid duplicates
+        self.cte_names = set()  # Track CTE names to exclude them
+        
+        # Extract CTE names first to exclude them from table list
+        cte_pattern = r'(?i)WITH\s+([^\s(]+)'
+        cte_matches = re.finditer(cte_pattern, sql)
+        for match in cte_matches:
+            cte_name = match.group(1).lower()
+            self.cte_names.add(cte_name)
+            # Add CTE to alias map but not to tables list
+            self.alias_map[cte_name] = cte_name
+        
         # Extract table references from FROM and JOIN clauses
         table_pattern = r'(?i)(?:FROM|JOIN)\s+([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?'
         matches = re.finditer(table_pattern, sql)
@@ -59,24 +72,29 @@ class SQLMetadataExtractor:
             clean_table = table.split('.')[-1].strip('`"[] ').lower()
             clean_alias = alias.split('.')[-1].strip('`"[] ').lower()
             
-            # Update maps
-            self.alias_map[clean_alias] = clean_table
-            self.reverse_alias_map[clean_table] = clean_alias
-            tables.append(clean_table)
+            # Skip if this is a CTE or a reference to a CTE
+            if clean_table in self.cte_names:
+                self.alias_map[clean_alias] = clean_table  # Still track CTE aliases
+                continue
             
-            # If table is its own alias, add it to both maps
-            if clean_table == clean_alias:
-                self.alias_map[clean_table] = clean_table
+            # Skip if this table is a CTE reference
+            if clean_table in self.alias_map and self.alias_map[clean_table] in self.cte_names:
+                continue
+            
+            # Add to tables list and update maps
+            if clean_table not in self.cte_names:  # Double check it's not a CTE
+                tables.add(clean_table)
+                self.alias_map[clean_alias] = clean_table
+                self.reverse_alias_map[clean_table] = clean_alias
+                
+                # If table is its own alias, add it to alias map
+                if clean_table == clean_alias:
+                    self.alias_map[clean_table] = clean_table
         
-        # Extract CTE names
-        cte_pattern = r'(?i)WITH\s+([^\s(]+)'
-        cte_matches = re.finditer(cte_pattern, sql)
-        for match in cte_matches:
-            cte_name = match.group(1).lower()
-            tables.append(cte_name)
-            self.alias_map[cte_name] = cte_name
+        # Filter out any remaining CTEs from tables
+        tables = {t for t in tables if t not in self.cte_names}
         
-        return tables
+        return list(tables)
 
     def _process_columns(self, sql: str, result: Dict[str, List[Set[str]]]):
         """Process columns with strict table association."""
@@ -97,6 +115,7 @@ class SQLMetadataExtractor:
             # Get actual table name from alias
             actual_table = self.alias_map.get(table_ref, table_ref)
             
+            # Only process if it's an actual table (not a CTE) and exists in our result
             if actual_table in result:
                 result[actual_table][0].add(column)
                 processed_columns.add(column)
@@ -105,10 +124,11 @@ class SQLMetadataExtractor:
         """Extract source codes associated with specific tables, handling all reference patterns."""
         table_source_codes = {}
         
-        # Initialize source codes for all tables
+        # Initialize source codes for all tables (only actual tables, not CTEs)
         for table in tables:
             clean_table = table.split('.')[-1].strip('`"[] ').lower()
-            table_source_codes[clean_table] = set()
+            if clean_table not in self.cte_names:  # Only add if not a CTE
+                table_source_codes[clean_table] = set()
         
         # Extract source codes using simpler patterns
         for col in self.source_code_columns:
@@ -121,6 +141,14 @@ class SQLMetadataExtractor:
             for col_match in in_matches:
                 table_ref = col_match.group(1).lower()
                 start_pos = col_match.end()
+                
+                # Get actual table name from alias
+                actual_table = self.alias_map.get(table_ref, table_ref)
+                
+                # Skip if this is a CTE reference or not in our tables list
+                if actual_table in self.cte_names or actual_table not in table_source_codes:
+                    continue
+                    
                 print(f"\nFound {col} IN reference for table/alias: {table_ref}")
                 
                 # Find the matching closing parenthesis
@@ -163,13 +191,10 @@ class SQLMetadataExtractor:
                             values.add(clean_value.strip("'"))
                     
                     print(f"Parsed IN values: {values}")
-                    
-                    # Get actual table name from alias if exists
-                    actual_table = self.alias_map.get(table_ref, table_ref)
                     print(f"Actual table name: {actual_table}")
                     
                     # Update source codes for the table
-                    if actual_table in table_source_codes:
+                    if actual_table not in self.cte_names:  # Only update if not a CTE
                         table_source_codes[actual_table].update(values)
                         print(f"Updated source codes for {actual_table}: {table_source_codes[actual_table]}")
             
@@ -180,23 +205,30 @@ class SQLMetadataExtractor:
             for eq_match in equals_matches:
                 table_ref = eq_match.group(1).lower()
                 value = eq_match.group(2)
+                
+                # Get actual table name from alias
+                actual_table = self.alias_map.get(table_ref, table_ref)
+                
+                # Skip if this is a CTE reference or not in our tables list
+                if actual_table in self.cte_names or actual_table not in table_source_codes:
+                    continue
+                    
                 print(f"\nFound {col} = reference for table/alias: {table_ref}")
                 print(f"Extracted = value: {value}")
-                
-                # Get actual table name from alias if exists
-                actual_table = self.alias_map.get(table_ref, table_ref)
                 print(f"Actual table name: {actual_table}")
                 
                 # Update source codes for the table
-                if actual_table in table_source_codes:
+                if actual_table not in self.cte_names:  # Only update if not a CTE
                     table_source_codes[actual_table].add(value)
                     print(f"Updated source codes for {actual_table}: {table_source_codes[actual_table]}")
         
         print("\nFinal table source codes:")
         for table, codes in table_source_codes.items():
-            print(f"{table}: {codes}")
+            if table not in self.cte_names:  # Only show actual tables
+                print(f"{table}: {codes}")
         
-        return table_source_codes
+        # Return only non-CTE tables
+        return {t: codes for t, codes in table_source_codes.items() if t not in self.cte_names}
 
     def _update_master_dict(self, current_metadata: Dict[str, List[Set[str]]]):
         """Update master dictionary with new metadata."""
@@ -290,9 +322,10 @@ def test_queries():
             result = extractor._extract_sql_metadata(test['sql'])
             print("\nExtracted Metadata:")
             for table, metadata in result.items():
-                print(f"\nTable: {table}")
-                print(f"Columns: {sorted(list(metadata[0]))}")
-                print(f"Source Codes: {sorted(list(metadata[1]))}")
+                if table not in extractor.cte_names:  # Only show actual tables
+                    print(f"\nTable: {table}")
+                    print(f"Columns: {sorted(list(metadata[0]))}")
+                    print(f"Source Codes: {sorted(list(metadata[1]))}")
         except Exception as e:
             print(f"Error processing test case: {str(e)}")
             continue
