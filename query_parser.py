@@ -182,58 +182,76 @@ class SQLMetadataExtractor:
         logger.info(f"CTE references: {cte_refs}")
         return ctes
 
-    def _extract_tables_and_aliases(self, sql: str) -> Dict[str, List[str]]:
-        """Extract table names and their aliases from SQL query."""
-        logger.info("Starting table and alias extraction")
+    def _extract_tables_and_aliases(self, query: str) -> Dict[str, List[str]]:
+        """Extract tables and their aliases from the query."""
         tables = {}
-
-        # First, extract all CTEs to ensure we can properly exclude them
-        self._extract_ctes(sql)
-
-        # Pattern to match table references in FROM and JOIN clauses
+        self.alias_map = {}
+        
+        # First extract CTEs to avoid processing them as tables
+        ctes = self._extract_ctes(query)
+        self.cte_names = set(ctes)
+        
+        # Original pattern for basic table identification
         table_pattern = r'(?i)(?:FROM|JOIN)\s+([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?'
-        matches = re.finditer(table_pattern, sql)
         
+        # Additional patterns for edge cases
+        additional_patterns = [
+            # Pattern for schema-qualified tables
+            r'(?i)(?:FROM|JOIN)\s+([^\s,;()]+)\.([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?',
+            # Pattern for quoted identifiers
+            r'(?i)(?:FROM|JOIN)\s+["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            # Pattern for tables with special characters
+            r'(?i)(?:FROM|JOIN)\s+["`]?([^\s,;()]+(?:-[^\s,;()]+)*)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            # Pattern for tables in subqueries
+            r'(?i)(?:FROM|JOIN)\s*\(\s*SELECT\s+.*?\s+FROM\s+([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?',
+            # Pattern for recursive CTEs
+            r'(?i)WITH\s+RECURSIVE\s+([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?'
+        ]
+        
+        # Process original pattern
+        matches = re.finditer(table_pattern, query)
         for match in matches:
-            table = match.group(1)
-            alias = match.group(2) if match.group(2) else table
+            table_name = match.group(1).lower()
+            alias = match.group(2).lower() if match.group(2) else table_name
             
-            # Clean up table and alias names
-            clean_table = table.split('.')[-1].strip('`"[] ').lower()
-            clean_alias = alias.split('.')[-1].strip('`"[] ').lower()
-            logger.info(f"Found table in FROM/JOIN: {clean_table} with alias: {clean_alias}")
-            
-            # Skip if this is a CTE or a reference to a CTE
-            if (clean_table in self.cte_names or 
-                clean_alias in self.cte_names or 
-                any(cte in clean_table for cte in self.cte_names) or
-                any(cte in clean_alias for cte in self.cte_names)):
-                logger.info(f"Skipping CTE or CTE reference: {clean_table} ({clean_alias})")
-                # Map CTE aliases to their CTE names
-                if clean_table in self.cte_names:
-                    self.alias_map[clean_alias] = clean_table
-                continue
-                
-            # Add the table to our list if it's not already there
-            if clean_table not in tables:
-                tables[clean_table] = [clean_alias]
-                # Map the alias to the actual table name
-                self.alias_map[clean_alias] = clean_table
-                logger.info(f"Added table: {clean_table} with alias: {clean_alias}")
-
-        # Filter out any remaining CTEs and their aliases from the tables list
-        filtered_tables = {}
-        for table, alias_list in tables.items():
-            if (table not in self.cte_names and 
-                not any(cte in table for cte in self.cte_names) and
-                not any(table in cte for cte in self.cte_names) and
-                not any(table == alias for alias in self.alias_map.keys() if self.alias_map[alias] in self.cte_names)):
-                filtered_tables[table] = alias_list
-                logger.info(f"Kept table after filtering: {table} with aliases: {alias_list}")
-            else:
-                logger.info(f"Filtered out table: {table}")
+            if table_name not in self.cte_names and alias not in self.cte_names:
+                if table_name not in tables:
+                    tables[table_name] = []
+                if alias not in tables[table_name]:
+                    tables[table_name].append(alias)
+                self.alias_map[alias] = table_name
+                logging.info(f"Found table in FROM/JOIN: {table_name} with alias: {alias}")
         
-        logger.info(f"Completed table and alias extraction. Found tables: {filtered_tables}")
+        # Process additional patterns for edge cases
+        for pattern in additional_patterns:
+            matches = re.finditer(pattern, query)
+            for match in matches:
+                groups = match.groups()
+                if len(groups) == 2:
+                    table_name, alias = groups
+                else:
+                    table_name, schema, alias = groups
+                    table_name = f"{schema}.{table_name}"
+                
+                table_name = table_name.lower()
+                alias = alias.lower() if alias else table_name
+                
+                if table_name not in self.cte_names and alias not in self.cte_names:
+                    if table_name not in tables:
+                        tables[table_name] = []
+                    if alias not in tables[table_name]:
+                        tables[table_name].append(alias)
+                    self.alias_map[alias] = table_name
+                    logging.info(f"Found table with additional pattern: {table_name} with alias: {alias}")
+        
+        # Filter out any remaining CTEs or CTE references
+        filtered_tables = {}
+        for table_name, aliases in tables.items():
+            if table_name not in self.cte_names and not any(alias in self.cte_names for alias in aliases):
+                filtered_tables[table_name] = aliases
+                logging.info(f"Kept table after filtering: {table_name} with aliases: {aliases}")
+        
+        logging.info(f"Completed table and alias extraction. Found tables: {filtered_tables}")
         return filtered_tables
 
     def _extract_columns(self, sql: str, table_name: str, alias_list: List[str]) -> Set[str]:
@@ -241,10 +259,26 @@ class SQLMetadataExtractor:
         print(f"\nExtracting columns for table: {table_name}")
         print(f"Using aliases: {alias_list}")
         columns = set()
-        # Pattern to match table.column references in various contexts
+        
+        # Original pattern to match table.column references
         column_pattern = r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)(?=\s*(?:,|\)|$|\s|AND|OR|IN|>|<|=|!=|>=|<=))'
+        
+        # Additional patterns for edge cases
+        additional_patterns = [
+            # Pattern for columns in window functions
+            r'(?i)(?:PARTITION\s+BY|ORDER\s+BY)\s+([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)',
+            # Pattern for columns in aggregate functions
+            r'(?i)(?:COUNT|SUM|AVG|MAX|MIN)\s*\(\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*\)',
+            # Pattern for columns in CASE statements
+            r'(?i)CASE\s+WHEN\s+([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)',
+            # Pattern for columns with special characters
+            r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*["`]?([a-zA-Z0-9_]+)["`]?\.["`]?([a-zA-Z0-9_-]+)["`]?',
+            # Pattern for columns in complex expressions
+            r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)(?:\s*[+\-*/]|\s+AS\s+|\s+IN\s+|\s*[=<>])'
+        ]
+        
+        # Process original pattern
         matches = re.finditer(column_pattern, sql)
-
         for match in matches:
             table_ref, column = match.groups()
             table_ref = table_ref.lower()
@@ -264,6 +298,28 @@ class SQLMetadataExtractor:
                 columns.add(column)
                 print(f"Added column {column} for table {actual_table}")
 
+        # Process additional patterns for edge cases
+        for pattern in additional_patterns:
+            matches = re.finditer(pattern, sql)
+            for match in matches:
+                table_ref, column = match.groups()
+                table_ref = table_ref.lower()
+                column = column.upper()
+                print(f"Found potential column reference with additional pattern: {table_ref}.{column}")
+
+                if column == '*' or 'NULL' in column:
+                    print(f"Skipping wildcard or NULL column: {column}")
+                    continue
+
+                # Get actual table name from alias
+                actual_table = self.alias_map.get(table_ref, table_ref)
+                print(f"Resolved table reference: {table_ref} -> {actual_table}")
+
+                # Only process if it's an actual table and exists in our result
+                if table_ref in alias_list:
+                    columns.add(column)
+                    print(f"Added column {column} for table {actual_table}")
+
         print(f"Final columns for {table_name}: {columns}")
         return columns
 
@@ -273,15 +329,37 @@ class SQLMetadataExtractor:
         print(f"\nExtracting source codes for table: {table_name}")
         print(f"Using aliases: {alias_list}")
         
-        # Pattern to match source code values in WHERE, JOIN, and CASE conditions
+        # Original pattern to match source code values
         source_code_pattern = r'(?i)(?:WHERE|AND|OR|ON|WHEN)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]'
+        
+        # Additional patterns for edge cases
+        additional_patterns = [
+            # Pattern for source codes in CASE statements
+            r'(?i)CASE\s+WHEN\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]',
+            # Pattern for source codes in window functions
+            r'(?i)(?:PARTITION\s+BY|ORDER\s+BY)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]',
+            # Pattern for source codes in complex expressions
+            r'(?i)(?:WHERE|AND|OR|ON|WHEN)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*(?:=|IN|LIKE)\s*[\'"]([^\'"]+)[\'"]',
+            # Pattern for source codes in subqueries
+            r'(?i)(?:WHERE|AND|OR|ON|WHEN)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s+IN\s*\(\s*SELECT\s+.*?\s+FROM\s+.*?\s+WHERE\s+.*?\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]'
+        ]
+        
         print(f"Searching for source codes with pattern: {source_code_pattern}")
         
+        # Process original pattern
         matches = re.finditer(source_code_pattern, query)
         for match in matches:
             source_code = match.group(1)
             print(f"Found source code: {source_code}")
             source_codes.add(source_code)
+            
+        # Process additional patterns for edge cases
+        for pattern in additional_patterns:
+            matches = re.finditer(pattern, query)
+            for match in matches:
+                source_code = match.group(1)
+                print(f"Found source code with additional pattern: {source_code}")
+                source_codes.add(source_code)
             
         # Also check for IN clauses with source codes
         in_pattern = r'(?i)(?:WHERE|AND|OR|ON)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s+IN\s*\(([^)]+)\)'
@@ -643,6 +721,237 @@ JOIN cte8 c8 ON c7.col1 = c8.col1
                 )
                 SELECT c1.*
                 FROM cte1 c1
+            """
+        },
+        {
+            "name": "CTE with Column List Test",
+            "sql": """
+                WITH cte1(col1, data_srce_cde) AS (
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde = 'A1'
+                )
+                SELECT c1.*
+                FROM cte1 c1
+            """
+        },
+        {
+            "name": "Schema Qualified Tables Test",
+            "sql": """
+                SELECT t1.col1, t1.data_srce_cde
+                FROM schema1.table1 t1
+                JOIN schema2.table2 t2 ON t1.col1 = t2.col1
+                WHERE t1.data_srce_cde = 'A1'
+            """
+        },
+        {
+            "name": "Quoted Identifiers Test",
+            "sql": """
+                SELECT "t1"."col1", "t1"."data_srce_cde"
+                FROM "table1" "t1"
+                JOIN `table2` `t2` ON "t1"."col1" = `t2`.`col1`
+                WHERE "t1"."data_srce_cde" = 'A1'
+            """
+        },
+        {
+            "name": "Complex Column Expressions Test",
+            "sql": """
+                SELECT 
+                    t1.col1 + t2.col1 as sum_col,
+                    CASE WHEN t1.data_srce_cde = 'A1' THEN t2.ar_srce_cde ELSE t3.data_srce_cde END as derived_col,
+                    ROW_NUMBER() OVER (PARTITION BY t1.data_srce_cde ORDER BY t1.col1) as rn
+                FROM table1 t1
+                JOIN table2 t2 ON t1.col1 = t2.col1
+                JOIN table3 t3 ON t2.col1 = t3.col1
+                WHERE t1.data_srce_cde = 'A1'
+            """
+        },
+        {
+            "name": "Special Characters Test",
+            "sql": """
+                SELECT t1."col-1", t1."data_srce_cde"
+                FROM "table-1" t1
+                WHERE t1."data_srce_cde" = 'A-1'
+            """
+        },
+        {
+            "name": "Complex Source Code Conditions Test",
+            "sql": """
+                SELECT t1.col1, t1.data_srce_cde
+                FROM table1 t1
+                WHERE (t1.data_srce_cde = 'A1' OR t1.data_srce_cde = 'B1')
+                AND t1.ar_srce_cde IN (
+                    SELECT t2.ar_srce_cde
+                    FROM table2 t2
+                    WHERE t2.data_srce_cde = 'C1'
+                )
+            """
+        },
+        {
+            "name": "Window Functions Test",
+            "sql": """
+                SELECT 
+                    t1.col1,
+                    t1.data_srce_cde,
+                    ROW_NUMBER() OVER (PARTITION BY t1.data_srce_cde ORDER BY t1.col1) as rn,
+                    LAG(t1.data_srce_cde) OVER (ORDER BY t1.col1) as prev_source
+                FROM table1 t1
+                WHERE t1.data_srce_cde = 'A1'
+            """
+        },
+        {
+            "name": "Aggregate Functions Test",
+            "sql": """
+                SELECT 
+                    t1.data_srce_cde,
+                    COUNT(t1.col1) as count_col,
+                    MAX(t2.ar_srce_cde) as max_source
+                FROM table1 t1
+                JOIN table2 t2 ON t1.col1 = t2.col1
+                WHERE t1.data_srce_cde = 'A1'
+                GROUP BY t1.data_srce_cde
+            """
+        },
+        {
+            "name": "Complex Subqueries Test",
+            "sql": """
+                SELECT t1.col1, t1.data_srce_cde
+                FROM table1 t1
+                WHERE t1.data_srce_cde IN (
+                    SELECT t2.data_srce_cde
+                    FROM table2 t2
+                    WHERE t2.ar_srce_cde IN (
+                        SELECT t3.ar_srce_cde
+                        FROM table3 t3
+                        WHERE t3.data_srce_cde = 'B1'
+                    )
+                )
+            """
+        },
+        {
+            "name": "Recursive CTE with Complex Conditions",
+            "sql": """
+                WITH RECURSIVE cte1 AS (
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde = 'A1'
+                    UNION ALL
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    JOIN cte1 c ON t1.col1 = c.col1
+                    WHERE t1.data_srce_cde IN (
+                        SELECT t2.data_srce_cde
+                        FROM table2 t2
+                        WHERE t2.ar_srce_cde = 'X1'
+                    )
+                )
+                SELECT c1.*
+                FROM cte1 c1
+            """
+        },
+        {
+            "name": "CTE with Column List",
+            "sql": """
+                WITH cte1(col1, data_srce_cde) AS (
+                    SELECT t1.col1, t1.data_srce_cde
+                    FROM table1 t1
+                    WHERE t1.data_srce_cde = 'A1'
+                )
+                SELECT c1.*
+                FROM cte1 c1
+            """
+        },
+        {
+            "name": "Schema Qualified Tables",
+            "sql": """
+                SELECT t1.col1, t1.data_srce_cde
+                FROM schema1.table1 t1
+                JOIN schema2.table2 t2 ON t1.col1 = t2.col1
+                WHERE t1.data_srce_cde = 'A1'
+            """
+        },
+        {
+            "name": "Quoted Identifiers",
+            "sql": """
+                SELECT "t1"."col1", "t1"."data_srce_cde"
+                FROM "table1" "t1"
+                JOIN `table2` `t2` ON "t1"."col1" = `t2`.`col1`
+                WHERE "t1"."data_srce_cde" = 'A1'
+            """
+        },
+        {
+            "name": "Complex Column Expressions",
+            "sql": """
+                SELECT 
+                    t1.col1 + t2.col1 as sum_col,
+                    CASE WHEN t1.data_srce_cde = 'A1' THEN t2.ar_srce_cde ELSE t3.data_srce_cde END as derived_col,
+                    ROW_NUMBER() OVER (PARTITION BY t1.data_srce_cde ORDER BY t1.col1) as rn
+                FROM table1 t1
+                JOIN table2 t2 ON t1.col1 = t2.col1
+                JOIN table3 t3 ON t2.col1 = t3.col1
+                WHERE t1.data_srce_cde = 'A1'
+            """
+        },
+        {
+            "name": "Special Characters",
+            "sql": """
+                SELECT t1."col-1", t1."data_srce_cde"
+                FROM "table-1" t1
+                WHERE t1."data_srce_cde" = 'A-1'
+            """
+        },
+        {
+            "name": "Complex Source Code Conditions",
+            "sql": """
+                SELECT t1.col1, t1.data_srce_cde
+                FROM table1 t1
+                WHERE (t1.data_srce_cde = 'A1' OR t1.data_srce_cde = 'B1')
+                AND t1.ar_srce_cde IN (
+                    SELECT t2.ar_srce_cde
+                    FROM table2 t2
+                    WHERE t2.data_srce_cde = 'C1'
+                )
+            """
+        },
+        {
+            "name": "Window Functions",
+            "sql": """
+                SELECT 
+                    t1.col1,
+                    t1.data_srce_cde,
+                    ROW_NUMBER() OVER (PARTITION BY t1.data_srce_cde ORDER BY t1.col1) as rn,
+                    LAG(t1.data_srce_cde) OVER (ORDER BY t1.col1) as prev_source
+                FROM table1 t1
+                WHERE t1.data_srce_cde = 'A1'
+            """
+        },
+        {
+            "name": "Aggregate Functions",
+            "sql": """
+                SELECT 
+                    t1.data_srce_cde,
+                    COUNT(t1.col1) as count_col,
+                    MAX(t2.ar_srce_cde) as max_source
+                FROM table1 t1
+                JOIN table2 t2 ON t1.col1 = t2.col1
+                WHERE t1.data_srce_cde = 'A1'
+                GROUP BY t1.data_srce_cde
+            """
+        },
+        {
+            "name": "Complex Subqueries",
+            "sql": """
+                SELECT t1.col1, t1.data_srce_cde
+                FROM table1 t1
+                WHERE t1.data_srce_cde IN (
+                    SELECT t2.data_srce_cde
+                    FROM table2 t2
+                    WHERE t2.ar_srce_cde IN (
+                        SELECT t3.ar_srce_cde
+                        FROM table3 t3
+                        WHERE t3.data_srce_cde = 'B1'
+                    )
+                )
             """
         }
     ]
