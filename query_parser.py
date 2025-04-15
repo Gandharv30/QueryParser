@@ -194,55 +194,71 @@ class SQLMetadataExtractor:
         # Original pattern for basic table identification
         table_pattern = r'(?i)(?:FROM|JOIN)\s+([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?'
         
-        # Additional patterns for edge cases
+        # Enhanced patterns for edge cases
         additional_patterns = [
-            # Pattern for schema-qualified tables
-            r'(?i)(?:FROM|JOIN)\s+([^\s,;()]+)\.([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?',
-            # Pattern for quoted identifiers
-            r'(?i)(?:FROM|JOIN)\s+["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
-            # Pattern for tables with special characters
-            r'(?i)(?:FROM|JOIN)\s+["`]?([^\s,;()]+(?:-[^\s,;()]+)*)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
-            # Pattern for tables in subqueries
-            r'(?i)(?:FROM|JOIN)\s*\(\s*SELECT\s+.*?\s+FROM\s+([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?',
-            # Pattern for recursive CTEs
-            r'(?i)WITH\s+RECURSIVE\s+([^\s,;()]+)(?:\s+(?:AS\s+)?([^\s,;()]+))?'
+            # Pattern for schema-qualified tables with optional quotes
+            r'(?i)(?:FROM|JOIN)\s+(?:["`]?([^\s,;()]+)["`]?\.)?["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            
+            # Pattern for tables after newlines/whitespace
+            r'(?i)(?:FROM|JOIN)\s*[\r\n]+\s*["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            
+            # Pattern for tables in subqueries with complex whitespace
+            r'(?i)(?:FROM|JOIN)\s*\(\s*(?:SELECT|WITH)[\s\S]*?FROM\s+["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            
+            # Pattern for tables with special characters and quoted identifiers
+            r'(?i)(?:FROM|JOIN)\s+["`]?([a-zA-Z0-9_-]+(?:[.][a-zA-Z0-9_-]+)*)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            
+            # Pattern for tables in USING clause
+            r'(?i)USING\s+["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            
+            # Pattern for tables in LATERAL joins
+            r'(?i)LATERAL\s+(?:SELECT|WITH)[\s\S]*?FROM\s+["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            
+            # Pattern for tables in CROSS/OUTER APPLY
+            r'(?i)(?:CROSS|OUTER)\s+APPLY\s+["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?'
         ]
         
-        # Process original pattern
-        matches = re.finditer(table_pattern, query)
-        for match in matches:
-            table_name = match.group(1).lower()
-            alias = match.group(2).lower() if match.group(2) else table_name
-            
-            if table_name not in self.cte_names and alias not in self.cte_names:
+        def process_matches(pattern, query):
+            matches = re.finditer(pattern, query)
+            for match in matches:
+                groups = match.groups()
+                
+                # Handle schema-qualified tables
+                if len(groups) == 3 and groups[0]:  # Schema present
+                    schema, table_name, alias = groups
+                    table_name = f"{schema}.{table_name}"
+                else:
+                    # Get last two groups for table and alias
+                    table_name = groups[-2] if len(groups) >= 2 else groups[0]
+                    alias = groups[-1] if len(groups) >= 2 and groups[-1] else table_name
+                
+                if not table_name:
+                    continue
+                    
+                table_name = table_name.lower()
+                alias = alias.lower() if alias else table_name
+                
+                # Skip CTEs and their aliases
+                if table_name in self.cte_names or alias in self.cte_names:
+                    continue
+                    
+                # Handle quoted identifiers
+                table_name = table_name.strip('`"')
+                alias = alias.strip('`"')
+                
                 if table_name not in tables:
                     tables[table_name] = []
                 if alias not in tables[table_name]:
                     tables[table_name].append(alias)
                 self.alias_map[alias] = table_name
-                logging.info(f"Found table in FROM/JOIN: {table_name} with alias: {alias}")
+                logging.info(f"Found table: {table_name} with alias: {alias}")
         
-        # Process additional patterns for edge cases
+        # Process original pattern first (preserved)
+        process_matches(table_pattern, query)
+        
+        # Process additional patterns
         for pattern in additional_patterns:
-            matches = re.finditer(pattern, query)
-            for match in matches:
-                groups = match.groups()
-                if len(groups) == 2:
-                    table_name, alias = groups
-                else:
-                    table_name, schema, alias = groups
-                    table_name = f"{schema}.{table_name}"
-                
-                table_name = table_name.lower()
-                alias = alias.lower() if alias else table_name
-                
-                if table_name not in self.cte_names and alias not in self.cte_names:
-                    if table_name not in tables:
-                        tables[table_name] = []
-                    if alias not in tables[table_name]:
-                        tables[table_name].append(alias)
-                    self.alias_map[alias] = table_name
-                    logging.info(f"Found table with additional pattern: {table_name} with alias: {alias}")
+            process_matches(pattern, query)
         
         # Filter out any remaining CTEs or CTE references
         filtered_tables = {}
@@ -251,7 +267,6 @@ class SQLMetadataExtractor:
                 filtered_tables[table_name] = aliases
                 logging.info(f"Kept table after filtering: {table_name} with aliases: {aliases}")
         
-        logging.info(f"Completed table and alias extraction. Found tables: {filtered_tables}")
         return filtered_tables
 
     def _extract_columns(self, sql: str, table_name: str, alias_list: List[str]) -> Set[str]:
@@ -260,66 +275,71 @@ class SQLMetadataExtractor:
         print(f"Using aliases: {alias_list}")
         columns = set()
         
-        # Original pattern to match table.column references
+        # Original pattern for basic column references (preserved)
         column_pattern = r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)(?=\s*(?:,|\)|$|\s|AND|OR|IN|>|<|=|!=|>=|<=))'
         
-        # Additional patterns for edge cases
+        # Enhanced patterns for edge cases
         additional_patterns = [
-            # Pattern for columns in window functions
-            r'(?i)(?:PARTITION\s+BY|ORDER\s+BY)\s+([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)',
-            # Pattern for columns in aggregate functions
-            r'(?i)(?:COUNT|SUM|AVG|MAX|MIN)\s*\(\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*\)',
-            # Pattern for columns in CASE statements
-            r'(?i)CASE\s+WHEN\s+([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)',
-            # Pattern for columns with special characters
+            # Pattern for columns in window functions with complex expressions
+            r'(?i)(?:PARTITION\s+BY|ORDER\s+BY)\s+(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)(?:\s*(?:ASC|DESC)?)',
+            
+            # Pattern for columns in aggregate functions with nested expressions
+            r'(?i)(?:COUNT|SUM|AVG|MAX|MIN|STDDEV|VARIANCE)\s*\(\s*(?:DISTINCT\s+)?(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)\s*\)',
+            
+            # Pattern for columns in CASE statements with multiple conditions
+            r'(?i)(?:CASE\s+(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)|(?:WHEN\s+(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?))|(?:THEN\s+(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?))|(?:ELSE\s+(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?))',
+            
+            # Pattern for columns with special characters and quoted identifiers
             r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*["`]?([a-zA-Z0-9_]+)["`]?\.["`]?([a-zA-Z0-9_-]+)["`]?',
-            # Pattern for columns in complex expressions
-            r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)(?:\s*[+\-*/]|\s+AS\s+|\s+IN\s+|\s*[=<>])'
+            
+            # Pattern for columns in complex expressions and functions
+            r'(?i)(?:COALESCE|NULLIF|CAST|CONVERT)\s*\(\s*(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)',
+            
+            # Pattern for columns in subqueries and EXISTS clauses
+            r'(?i)(?:EXISTS|IN|ANY|ALL)\s*\(\s*SELECT[\s\S]*?(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)',
+            
+            # Pattern for columns in GROUP BY and HAVING clauses
+            r'(?i)(?:GROUP\s+BY|HAVING)\s+(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)',
+            
+            # Pattern for columns after newlines/whitespace
+            r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*[\r\n]+\s*(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)',
+            
+            # Pattern for columns in JOIN conditions with complex spacing
+            r'(?i)(?:JOIN\s+[^\s]+\s+(?:AS\s+)?[^\s]+\s+ON\s+)(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)'
         ]
         
-        # Process original pattern
-        matches = re.finditer(column_pattern, sql)
-        for match in matches:
-            table_ref, column = match.groups()
-            table_ref = table_ref.lower()
-            column = column.upper()
-            print(f"Found potential column reference: {table_ref}.{column}")
-
-            if column == '*' or 'NULL' in column:
-                print(f"Skipping wildcard or NULL column: {column}")
-                continue
-
-            # Get actual table name from alias
-            actual_table = self.alias_map.get(table_ref, table_ref)
-            print(f"Resolved table reference: {table_ref} -> {actual_table}")
-
-            # Only process if it's an actual table and exists in our result
-            if table_ref in alias_list:
-                columns.add(column)
-                print(f"Added column {column} for table {actual_table}")
-
-        # Process additional patterns for edge cases
-        for pattern in additional_patterns:
+        def process_matches(pattern, sql):
             matches = re.finditer(pattern, sql)
             for match in matches:
-                table_ref, column = match.groups()
-                table_ref = table_ref.lower()
-                column = column.upper()
-                print(f"Found potential column reference with additional pattern: {table_ref}.{column}")
-
-                if column == '*' or 'NULL' in column:
-                    print(f"Skipping wildcard or NULL column: {column}")
-                    continue
-
-                # Get actual table name from alias
-                actual_table = self.alias_map.get(table_ref, table_ref)
-                print(f"Resolved table reference: {table_ref} -> {actual_table}")
-
-                # Only process if it's an actual table and exists in our result
-                if table_ref in alias_list:
-                    columns.add(column)
-                    print(f"Added column {column} for table {actual_table}")
-
+                groups = match.groups()
+                
+                # Process all potential table/column pairs in the groups
+                for i in range(0, len(groups), 2):
+                    if i + 1 >= len(groups) or not groups[i] or not groups[i+1]:
+                        continue
+                        
+                    table_ref = groups[i].lower()
+                    column = groups[i+1].upper()
+                    
+                    if column == '*' or 'NULL' in column:
+                        continue
+                    
+                    # Handle quoted identifiers
+                    table_ref = table_ref.strip('`"')
+                    column = column.strip('`"')
+                    
+                    # Only process if it's a relevant table reference
+                    if table_ref in alias_list:
+                        columns.add(column)
+                        print(f"Added column {column} for table {table_name} via {table_ref}")
+        
+        # Process original pattern first (preserved)
+        process_matches(column_pattern, sql)
+        
+        # Process additional patterns
+        for pattern in additional_patterns:
+            process_matches(pattern, sql)
+        
         print(f"Final columns for {table_name}: {columns}")
         return columns
 
@@ -329,39 +349,57 @@ class SQLMetadataExtractor:
         print(f"\nExtracting source codes for table: {table_name}")
         print(f"Using aliases: {alias_list}")
         
-        # Original pattern to match source code values
+        # Original pattern for basic source code values (preserved)
         source_code_pattern = r'(?i)(?:WHERE|AND|OR|ON|WHEN)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]'
         
-        # Additional patterns for edge cases
+        # Enhanced patterns for edge cases
         additional_patterns = [
-            # Pattern for source codes in CASE statements
-            r'(?i)CASE\s+WHEN\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]',
-            # Pattern for source codes in window functions
+            # Pattern for source codes in CASE statements with multiple conditions
+            r'(?i)(?:CASE\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s+WHEN\s+[\'"]([^\'"]+)[\'"]|'
+            r'WHEN\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"])',
+            
+            # Pattern for source codes in window functions and partitions
             r'(?i)(?:PARTITION\s+BY|ORDER\s+BY)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]',
+            
             # Pattern for source codes in complex expressions
-            r'(?i)(?:WHERE|AND|OR|ON|WHEN)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*(?:=|IN|LIKE)\s*[\'"]([^\'"]+)[\'"]',
+            r'(?i)(?:WHERE|AND|OR|ON|WHEN)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*(?:=|IN|LIKE|REGEXP)\s*[\'"]([^\'"]+)[\'"]',
+            
             # Pattern for source codes in subqueries
-            r'(?i)(?:WHERE|AND|OR|ON|WHEN)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s+IN\s*\(\s*SELECT\s+.*?\s+FROM\s+.*?\s+WHERE\s+.*?\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]'
+            r'(?i)(?:WHERE|AND|OR|ON|WHEN)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s+IN\s*\(\s*SELECT[\s\S]*?[\'"]([^\'"]+)[\'"]',
+            
+            # Pattern for source codes with quoted identifiers and special characters
+            r'(?i)(?:WHERE|AND|OR|ON|WHEN)\s+["`]?(?:' + '|'.join(alias_list) + r')["`]?\.["`]?(?:data_srce_cde|ar_srce_cde)["`]?\s*=\s*[\'"]([^\'"]+)[\'"]',
+            
+            # Pattern for source codes in HAVING clauses
+            r'(?i)HAVING\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]',
+            
+            # Pattern for source codes after newlines/whitespace
+            r'(?i)(?:WHERE|AND|OR|ON|WHEN)\s*[\r\n]+\s*(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]',
+            
+            # Pattern for source codes in complex JOIN conditions
+            r'(?i)JOIN\s+[^\s]+\s+(?:AS\s+)?[^\s]+\s+ON\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]',
+            
+            # Pattern for source codes in EXISTS clauses
+            r'(?i)EXISTS\s*\(\s*SELECT[\s\S]*?(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s*=\s*[\'"]([^\'"]+)[\'"]'
         ]
         
-        print(f"Searching for source codes with pattern: {source_code_pattern}")
-        
-        # Process original pattern
-        matches = re.finditer(source_code_pattern, query)
-        for match in matches:
-            source_code = match.group(1)
-            print(f"Found source code: {source_code}")
-            source_codes.add(source_code)
-            
-        # Process additional patterns for edge cases
-        for pattern in additional_patterns:
+        def process_matches(pattern, query):
             matches = re.finditer(pattern, query)
             for match in matches:
-                source_code = match.group(1)
-                print(f"Found source code with additional pattern: {source_code}")
-                source_codes.add(source_code)
+                # Get all non-None groups (some patterns have multiple capture groups)
+                values = [g for g in match.groups() if g is not None]
+                for value in values:
+                    print(f"Found source code: {value}")
+                    source_codes.add(value)
+        
+        # Process original pattern first (preserved)
+        process_matches(source_code_pattern, query)
+        
+        # Process additional patterns
+        for pattern in additional_patterns:
+            process_matches(pattern, query)
             
-        # Also check for IN clauses with source codes
+        # Also check for IN clauses with source codes (preserved)
         in_pattern = r'(?i)(?:WHERE|AND|OR|ON)\s+(?:' + '|'.join(alias_list) + r')\.(?:data_srce_cde|ar_srce_cde)\s+IN\s*\(([^)]+)\)'
         print(f"Searching for IN clauses with pattern: {in_pattern}")
         
