@@ -92,24 +92,62 @@ class SQLMetadataExtractor:
         ctes = []
         cte_hierarchy = {}  # Track parent-child relationships
         
-        # First, find the main WITH clause
-        with_match = re.search(r'(?i)WITH\s+(?:RECURSIVE\s+)?(.+?)(?=\s+SELECT\s+(?!.*\bAS\s*\())', sql, re.DOTALL)
+        # Remove comments first to avoid false matches
+        def remove_comments(sql):
+            # Remove inline comments
+            sql = re.sub(r'--.*$', '', sql, flags=re.MULTILINE)
+            # Remove block comments
+            sql = re.sub(r'/\*[\s\S]*?\*/', '', sql)
+            return sql
+        
+        sql = remove_comments(sql)
+        
+        # First, find the main WITH clause, handling complex whitespace and comments
+        with_match = re.search(
+            r'(?i)WITH\s*(?:RECURSIVE\s+)?'  # WITH keyword with optional RECURSIVE
+            r'(?:\s*--[^\n]*\n)*'            # Optional inline comments
+            r'(?:\s*/\*[\s\S]*?\*/)*'        # Optional block comments
+            r'\s*(.+?)'                       # CTE content
+            r'(?=\s+SELECT\s+(?!.*\bAS\s*\())',  # Look ahead for SELECT
+            sql, 
+            re.DOTALL
+        )
+        
         if not with_match:
             logger.info("No CTEs found in query")
             return []
         
         cte_block = with_match.group(1)
-        logger.info(f"Found CTE block: {cte_block[:100]}...")  # Log first 100 chars for debugging
+        logger.info(f"Found CTE block: {cte_block[:100]}...")
         
-        # Split the CTE block into individual CTEs while respecting nested parentheses
         def split_ctes(cte_block: str) -> List[str]:
             result = []
             current = []
             paren_count = 0
+            quote_char = None
             in_cte = False
             in_subquery = False
             
-            for char in cte_block:
+            i = 0
+            while i < len(cte_block):
+                char = cte_block[i]
+                
+                # Handle quoted identifiers and string literals
+                if char in ('"', '`', "'") and (i == 0 or cte_block[i-1] != '\\'):
+                    if quote_char is None:
+                        quote_char = char
+                    elif char == quote_char:
+                        quote_char = None
+                    current.append(char)
+                    i += 1
+                    continue
+                
+                # Skip characters in quotes
+                if quote_char is not None:
+                    current.append(char)
+                    i += 1
+                    continue
+                
                 # Track parentheses for subqueries
                 if char == '(':
                     paren_count += 1
@@ -120,20 +158,24 @@ class SQLMetadataExtractor:
                     if paren_count == 0:
                         in_subquery = False
                 
-                # Only split at commas when we're at the top level and in a CTE
+                # Handle commas at the top level
                 if char == ',' and paren_count == 0 and in_cte:
                     if current:
                         result.append(''.join(current).strip())
                         current = []
                     in_cte = False
+                    i += 1
                     continue
                 
-                # Check for AS keyword to mark start of CTE definition
-                if len(current) >= 2 and ''.join(current[-2:]).upper() == 'AS':
-                    in_cte = True
-                    in_subquery = False
+                # Look for AS keyword
+                if len(current) >= 2 and not in_cte:
+                    last_two = ''.join(current[-2:]).upper()
+                    if last_two == 'AS' and not re.search(r'[a-zA-Z0-9_]', cte_block[i+1:i+2] or ''):
+                        in_cte = True
+                        in_subquery = False
                 
                 current.append(char)
+                i += 1
             
             if current and in_cte:
                 result.append(''.join(current).strip())
@@ -143,17 +185,36 @@ class SQLMetadataExtractor:
         cte_definitions = split_ctes(cte_block)
         logger.info(f"Found {len(cte_definitions)} CTE definitions")
         
+        # Enhanced pattern for CTE name extraction
+        cte_name_pattern = r'''
+            ^\s*                           # Start of string with optional whitespace
+            (?:["`]([^"`]+)["`]|          # Quoted identifier
+            ([a-zA-Z0-9_-]+))             # Regular identifier
+            \s*                           # Optional whitespace
+            (?:\s*\([^)]*\))?            # Optional column list
+            \s+AS\s*\(                    # AS keyword and opening parenthesis
+        '''
+        
         # Extract CTE names and build hierarchy
         for cte_def in cte_definitions:
-            # Match CTE name before AS, handling various whitespace patterns and column lists
-            cte_match = re.match(r'^\s*([^\s,(]+)(?:\s*\([^)]*\))?\s+AS\s*\(', cte_def)
+            # Match CTE name with enhanced pattern
+            cte_match = re.match(cte_name_pattern, cte_def, re.VERBOSE)
             if cte_match:
-                cte_name = cte_match.group(1)
+                # Get the CTE name from either quoted or unquoted group
+                cte_name = (cte_match.group(1) or cte_match.group(2)).strip('`"')
                 ctes.append(cte_name)
                 logger.info(f"Found CTE: {cte_name}")
                 
                 # Check for nested CTEs
-                nested_with = re.search(r'(?i)WITH\s+(?:RECURSIVE\s+)?(.+?)(?=\s+SELECT\s+(?!.*\bAS\s*\())', cte_def)
+                nested_with = re.search(
+                    r'(?i)WITH\s*(?:RECURSIVE\s+)?'
+                    r'(?:\s*--[^\n]*\n)*'
+                    r'(?:\s*/\*[\s\S]*?\*/)*'
+                    r'\s*(.+?)'
+                    r'(?=\s+SELECT\s+(?!.*\bAS\s*\())',
+                    cte_def,
+                    re.DOTALL
+                )
                 if nested_with:
                     nested_ctes = self._extract_ctes(cte_def)
                     if nested_ctes:
@@ -161,15 +222,25 @@ class SQLMetadataExtractor:
                         ctes.extend(nested_ctes)
                         logger.info(f"Found nested CTEs under {cte_name}: {nested_ctes}")
         
-        # Also find any references to CTEs in FROM/JOIN clauses
+        # Find CTE references with enhanced pattern
         main_query = sql[with_match.end():]
-        cte_refs = {}  # Map CTEs to their aliases
+        cte_refs = {}
         for cte in ctes:
-            # Look for CTE references in FROM/JOIN clauses
-            cte_ref_matches = re.finditer(rf'\b{re.escape(cte)}\s+(?:AS\s+)?([^\s,)]+)', main_query)
+            # Look for CTE references with quoted identifiers and aliases
+            cte_ref_pattern = fr'''
+                \b{re.escape(cte)}\b  # CTE name
+                \s*                    # Optional whitespace
+                (?:AS\s+)?            # Optional AS keyword
+                (?:                    # Start alias group
+                    ["`]([^"`]+)["`]| # Quoted alias
+                    ([a-zA-Z0-9_-]+)  # Regular alias
+                )
+            '''
+            cte_ref_matches = re.finditer(cte_ref_pattern, main_query, re.VERBOSE)
             aliases = set()
             for ref in cte_ref_matches:
-                alias = ref.group(1)
+                # Get alias from either quoted or unquoted group
+                alias = (ref.group(1) or ref.group(2)).strip('`"')
                 aliases.add(alias)
                 logger.info(f"Found CTE reference: {cte} AS {alias}")
             if aliases:
@@ -196,26 +267,88 @@ class SQLMetadataExtractor:
         
         # Enhanced patterns for edge cases
         additional_patterns = [
-            # Pattern for schema-qualified tables with optional quotes
-            r'(?i)(?:FROM|JOIN)\s+(?:["`]?([^\s,;()]+)["`]?\.)?["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            # Pattern for schema-qualified tables with optional quotes and complex identifiers
+            r'''(?ix)
+                (?:FROM|JOIN)\s+
+                (?:
+                    (?:["`]?(?:[a-zA-Z0-9_-]+(?:\s*\.\s*[a-zA-Z0-9_-]+)*)["`]?\.)? # Optional schema
+                    ["`]?([a-zA-Z0-9_-]+(?:\s*\.\s*[a-zA-Z0-9_-]+)*)["`]?          # Table name
+                    (?:\s+(?:AS\s+)?["`]?([a-zA-Z0-9_-]+)["`]?)?                    # Optional alias
+                )
+            ''',
             
-            # Pattern for tables after newlines/whitespace
-            r'(?i)(?:FROM|JOIN)\s*[\r\n]+\s*["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            # Pattern for tables after newlines/whitespace with comments
+            r'''(?ix)
+                (?:FROM|JOIN)\s*
+                (?:--[^\n]*\n|/\*(?:[^*]|\*(?!/))*\*/)*   # Optional comments
+                \s*
+                ["`]?([a-zA-Z0-9_-]+(?:\s*\.\s*[a-zA-Z0-9_-]+)*)["`]?
+                (?:\s+(?:AS\s+)?["`]?([a-zA-Z0-9_-]+)["`]?)?
+            ''',
             
-            # Pattern for tables in subqueries with complex whitespace
-            r'(?i)(?:FROM|JOIN)\s*\(\s*(?:SELECT|WITH)[\s\S]*?FROM\s+["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            # Pattern for tables in subqueries with complex whitespace and comments
+            r'''(?ix)
+                (?:FROM|JOIN)\s*\(\s*
+                (?:SELECT|WITH)[\s\S]*?
+                FROM\s+
+                ["`]?([a-zA-Z0-9_-]+(?:\s*\.\s*[a-zA-Z0-9_-]+)*)["`]?
+                (?:\s+(?:AS\s+)?["`]?([a-zA-Z0-9_-]+)["`]?)?
+            ''',
             
-            # Pattern for tables with special characters and quoted identifiers
-            r'(?i)(?:FROM|JOIN)\s+["`]?([a-zA-Z0-9_-]+(?:[.][a-zA-Z0-9_-]+)*)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            # Pattern for tables in PIVOT/UNPIVOT operations
+            r'''(?ix)
+                (?:PIVOT|UNPIVOT)\s*\(\s*
+                [^)]*\)\s+(?:AS\s+)?
+                ["`]?([a-zA-Z0-9_-]+)["`]?
+                (?:\s+(?:AS\s+)?["`]?([a-zA-Z0-9_-]+)["`]?)?
+            ''',
             
-            # Pattern for tables in USING clause
-            r'(?i)USING\s+["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            # Pattern for tables in CROSS/OUTER APPLY with table-valued functions
+            r'''(?ix)
+                (?:CROSS|OUTER)\s+APPLY\s+
+                ["`]?([a-zA-Z0-9_-]+(?:\s*\.\s*[a-zA-Z0-9_-]+)*)["`]?
+                (?:\s*\([^)]*\))?
+                (?:\s+(?:AS\s+)?["`]?([a-zA-Z0-9_-]+)["`]?)?
+            ''',
             
-            # Pattern for tables in LATERAL joins
-            r'(?i)LATERAL\s+(?:SELECT|WITH)[\s\S]*?FROM\s+["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?',
+            # Pattern for tables in MERGE statements
+            r'''(?ix)
+                MERGE(?:\s+INTO)?\s+
+                ["`]?([a-zA-Z0-9_-]+(?:\s*\.\s*[a-zA-Z0-9_-]+)*)["`]?
+                (?:\s+(?:AS\s+)?["`]?([a-zA-Z0-9_-]+)["`]?)?
+            ''',
             
-            # Pattern for tables in CROSS/OUTER APPLY
-            r'(?i)(?:CROSS|OUTER)\s+APPLY\s+["`]?([^\s,;()]+)["`]?(?:\s+(?:AS\s+)?["`]?([^\s,;()]+)["`]?)?'
+            # Pattern for tables in complex JOIN variations
+            r'''(?ix)
+                (?:
+                    (?:LEFT|RIGHT|FULL|INNER|CROSS|NATURAL)\s+
+                    (?:OUTER\s+)?
+                    (?:HASH\s+)?
+                    (?:LOOP\s+)?
+                )?
+                JOIN\s+
+                ["`]?([a-zA-Z0-9_-]+(?:\s*\.\s*[a-zA-Z0-9_-]+)*)["`]?
+                (?:\s+(?:AS\s+)?["`]?([a-zA-Z0-9_-]+)["`]?)?
+            ''',
+            
+            # Pattern for tables in USING clause with complex identifiers
+            r'''(?ix)
+                USING\s+
+                ["`]?([a-zA-Z0-9_-]+(?:\s*\.\s*[a-zA-Z0-9_-]+)*)["`]?
+                (?:\s+(?:AS\s+)?["`]?([a-zA-Z0-9_-]+)["`]?)?
+            ''',
+            
+            # Pattern for tables in LATERAL joins with subqueries
+            r'''(?ix)
+                LATERAL\s+
+                (?:
+                    (?:SELECT|WITH)[\s\S]*?FROM\s+
+                    ["`]?([a-zA-Z0-9_-]+(?:\s*\.\s*[a-zA-Z0-9_-]+)*)["`]?
+                    |
+                    ["`]?([a-zA-Z0-9_-]+(?:\s*\.\s*[a-zA-Z0-9_-]+)*)["`]?
+                )
+                (?:\s+(?:AS\s+)?["`]?([a-zA-Z0-9_-]+)["`]?)?
+            '''
         ]
         
         def process_matches(pattern, query):
@@ -280,32 +413,113 @@ class SQLMetadataExtractor:
         
         # Enhanced patterns for edge cases
         additional_patterns = [
-            # Pattern for columns in window functions with complex expressions
-            r'(?i)(?:PARTITION\s+BY|ORDER\s+BY)\s+(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)(?:\s*(?:ASC|DESC)?)',
+            # Pattern for columns in window functions with complex expressions and partitioning
+            r'''(?ix)
+                (?:
+                    PARTITION\s+BY|
+                    ORDER\s+BY|
+                    ROWS|RANGE\s+BETWEEN
+                )\s+
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?\.)
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?)
+                (?:\s*(?:ASC|DESC|NULLS\s+(?:FIRST|LAST))?)?
+            ''',
             
-            # Pattern for columns in aggregate functions with nested expressions
-            r'(?i)(?:COUNT|SUM|AVG|MAX|MIN|STDDEV|VARIANCE)\s*\(\s*(?:DISTINCT\s+)?(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)\s*\)',
+            # Pattern for columns in aggregate functions with DISTINCT and nested expressions
+            r'''(?ix)
+                (?:
+                    COUNT|SUM|AVG|MAX|MIN|STDDEV|VARIANCE|
+                    FIRST_VALUE|LAST_VALUE|LAG|LEAD|
+                    STRING_AGG|ARRAY_AGG
+                )\s*\(\s*
+                (?:DISTINCT\s+)?
+                (?:ALL\s+)?
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?\.)
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?)
+                (?:\s*(?:,\s*\d+|\s*IGNORE\s+NULLS)?)?
+                \s*\)
+            ''',
             
-            # Pattern for columns in CASE statements with multiple conditions
-            r'(?i)(?:CASE\s+(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)|(?:WHEN\s+(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?))|(?:THEN\s+(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?))|(?:ELSE\s+(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?))',
+            # Pattern for columns in CASE statements with multiple conditions and nested expressions
+            r'''(?ix)
+                (?:
+                    CASE\s+(?:["`]?([a-zA-Z0-9_-]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)|
+                    WHEN\s+(?:["`]?([a-zA-Z0-9_-]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)|
+                    THEN\s+(?:["`]?([a-zA-Z0-9_-]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)|
+                    ELSE\s+(?:["`]?([a-zA-Z0-9_-]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)
+                )
+                (?:\s*(?:[=<>!]+|\bIS\b|\bLIKE\b|\bIN\b|\bBETWEEN\b)\s*)?
+            ''',
             
-            # Pattern for columns with special characters and quoted identifiers
-            r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*["`]?([a-zA-Z0-9_]+)["`]?\.["`]?([a-zA-Z0-9_-]+)["`]?',
+            # Pattern for columns with special characters, quoted identifiers, and schema qualification
+            r'''(?ix)
+                (?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*
+                (?:["`]?(?:[a-zA-Z0-9_-]+\.)?[a-zA-Z0-9_-]+["`]?\.)
+                ["`]?([a-zA-Z0-9_-]+)["`]?
+                (?:\s*(?:AS\s+["`]?[a-zA-Z0-9_-]+["`]?)?)?
+            ''',
             
-            # Pattern for columns in complex expressions and functions
-            r'(?i)(?:COALESCE|NULLIF|CAST|CONVERT)\s*\(\s*(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)',
+            # Pattern for columns in complex expressions and functions with type casting
+            r'''(?ix)
+                (?:
+                    COALESCE|NULLIF|CAST|CONVERT|TRY_CAST|TRY_CONVERT|
+                    ISNULL|NVL|DECODE|IFF
+                )\s*\(\s*
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?\.)
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?)
+                (?:\s*,|\s+AS\b)?
+            ''',
             
-            # Pattern for columns in subqueries and EXISTS clauses
-            r'(?i)(?:EXISTS|IN|ANY|ALL)\s*\(\s*SELECT[\s\S]*?(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)',
+            # Pattern for columns in subqueries and EXISTS clauses with complex conditions
+            r'''(?ix)
+                (?:EXISTS|IN|ANY|ALL|SOME)\s*\(\s*
+                SELECT\b(?:(?!SELECT|FROM).)*?
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?\.)
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?)
+            ''',
             
-            # Pattern for columns in GROUP BY and HAVING clauses
-            r'(?i)(?:GROUP\s+BY|HAVING)\s+(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)',
+            # Pattern for columns in GROUP BY and HAVING clauses with expressions
+            r'''(?ix)
+                (?:GROUP\s+BY|HAVING)\s+
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?\.)
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?)
+                (?:\s*,|\s+(?:ASC|DESC)|\s*(?:[=<>!]+|\bIS\b|\bLIKE\b|\bIN\b|\bBETWEEN\b))?
+            ''',
             
-            # Pattern for columns after newlines/whitespace
-            r'(?i)(?:SELECT|WHERE|ON|AND|OR|,|\(|\s)\s*[\r\n]+\s*(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)',
+            # Pattern for columns in JSON/XML path expressions
+            r'''(?ix)
+                (?:
+                    JSON_VALUE|JSON_QUERY|JSON_MODIFY|
+                    XPATH|XQUERY
+                )\s*\(\s*
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?\.)
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?)
+                \s*,
+            ''',
             
-            # Pattern for columns in JOIN conditions with complex spacing
-            r'(?i)(?:JOIN\s+[^\s]+\s+(?:AS\s+)?[^\s]+\s+ON\s+)(?:["`]?([a-zA-Z0-9_]+)["`]?\.)(?:["`]?([a-zA-Z0-9_-]+)["`]?)'
+            # Pattern for columns in MERGE statements with complex conditions
+            r'''(?ix)
+                (?:
+                    MERGE\s+INTO\s+[^\s]+\s+(?:AS\s+)?[^\s]+\s+
+                    (?:USING|ON|WHEN\s+MATCHED|WHEN\s+NOT\s+MATCHED)\s+
+                )?
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?\.)
+                (?:["`]?([a-zA-Z0-9_-]+)["`]?)
+            ''',
+            
+            # Pattern for columns in PIVOT/UNPIVOT operations
+            r'''(?ix)
+                (?:PIVOT|UNPIVOT)\s*\(\s*
+                (?:
+                    [^\s]*\s+
+                    (?:["`]?([a-zA-Z0-9_-]+)["`]?\.)
+                    (?:["`]?([a-zA-Z0-9_-]+)["`]?)
+                    |
+                    (?:["`]?([a-zA-Z0-9_-]+)["`]?\.)
+                    (?:["`]?([a-zA-Z0-9_-]+)["`]?)
+                    \s+[^\s]*
+                )
+            '''
         ]
         
         def process_matches(pattern, sql):
