@@ -1,7 +1,6 @@
 import pandas as pd
 import sqlglot
 import sqlglot.expressions as exp
-from sql_metadata import Parser
 from typing import Dict, Set, List, Optional
 import re
 import logging
@@ -10,7 +9,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class CombinedSQLMetadataExtractor:
+class ImprovedSQLMetadataExtractor:
     def __init__(self, dialect: Optional[str] = None):
         """
         Initializes the extractor.
